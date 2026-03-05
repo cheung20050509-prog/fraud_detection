@@ -1,0 +1,42 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*.lnk
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+backend/venv/
+.ipynb_checkpoints/
+backend/app/.ipynb_checkpoints/
+
+# Node
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+frontend/dist/
+
+# Runtime data
+backend/logs/
+backend/uploads/
+backend/*.db
+backend/fraud_detection.db
+
+# Large model assets
+backend/models/
+
+# Local env files
+.env
+.env.*

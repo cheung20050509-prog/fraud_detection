@@ -1,0 +1,62 @@
+# 电信诈骗风险阻断系统 - 后端依赖
+
+# 核心Web框架
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# 实时通信 (FastRTC/WebSocket)
+fastrtc==0.0.15
+websockets==12.0
+aiortc==1.6.0
+
+# AI模型相关
+torch==2.1.0
+torchaudio==2.1.0
+transformers==4.35.2
+# Qwen2Audio（可选，官方模型需要手动安装）
+# pip install git+https://github.com/QwenLM/Qwen2Audio.git
+openai-whisper==20231117
+funasr==1.0.25
+edge-tts==6.1.10
+# 降级方案：使用Mock模型（如无法获取Qwen2Audio官方源码）
+# pip install mock-alibaba-qwen2audio
+
+# 音频处理
+librosa==0.10.1
+soundfile==0.12.1
+pyaudio==0.2.11
+numpy==1.24.3
+scipy==1.11.4
+
+# 数据库和ORM
+sqlalchemy==2.0.23
+alembic==1.12.1
+sqlite3  # Python内置
+
+# 异步支持
+asyncio-mqtt==0.16.1
+aiofiles==23.2.1
+httpx==0.25.2
+
+# 数据验证和序列化
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# 工具库
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-decouple==3.8
+
+# 日志和监控
+loguru==0.7.2
+prometheus-client==0.19.0
+
+# 安全中间件
+python-cors==1.7.0
+
+# 开发工具
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+isort==5.12.0
