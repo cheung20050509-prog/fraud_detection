@@ -34,8 +34,13 @@ backend/uploads/
 backend/*.db
 backend/fraud_detection.db
 
-# Large model assets
-backend/models/
+# Large model assets are tracked via Git LFS (see .gitattributes)
+
+# GitHub LFS hard limit: single file must be <= 2GB
+backend/models/qwen2-audio/model-00001-of-00004.safetensors
+backend/models/qwen2-audio/model-00002-of-00004.safetensors
+backend/models/qwen2-audio/model-00003-of-00004.safetensors
+backend/models/qwen2-audio/model-00004-of-00004.safetensors
 
 # Local env files
 .env
