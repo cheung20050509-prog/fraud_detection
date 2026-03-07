@@ -7,6 +7,7 @@ export interface RecorderConfig {
   sampleRate?: number
   channels?: number
   chunkSize?: number
+  streaming?: boolean
   format?: 'audio/webm' | 'audio/mp4' | 'audio/wav'
   maxDuration?: number // 最大录制时长（秒）
   autoStart?: boolean // 是否自动开始
@@ -39,12 +40,15 @@ export class AudioRecorder {
   private state: RecorderState
   private startTime: number = 0
   private pausedTime: number = 0
+  private onVolumeChange?: (level: number) => void
+  private stopResolver: ((audioBlob: Blob | null) => void) | null = null
   
   constructor(config: RecorderConfig = {}) {
     this.config = {
       sampleRate: config.sampleRate || 16000,
       channels: config.channels || 1,
       chunkSize: config.chunkSize || 1024,
+      streaming: config.streaming ?? true,
       format: config.format || 'audio/webm',
       maxDuration: config.maxDuration || 300, // 5分钟
       autoStart: config.autoStart || false,
@@ -144,8 +148,13 @@ export class AudioRecorder {
       this.state.isPaused = false
       this.startTime = Date.now()
       this.pausedTime = 0
+      this.stopResolver = null
 
-      this.mediaRecorder?.start(this.config.chunkSize)
+      if (this.config.streaming) {
+        this.mediaRecorder?.start(this.config.chunkSize)
+      } else {
+        this.mediaRecorder?.start()
+      }
       
       // 开始音量检测
       this.startVolumeDetection()
@@ -164,7 +173,7 @@ export class AudioRecorder {
   /**
    * 停止录制 - 软著申请：音频录制停止
    */
-  stop(): Blob | null {
+  async stop(): Promise<Blob | null> {
     if (!this.state.isRecording) {
       console.warn('当前没有在录制')
       return null
@@ -175,7 +184,11 @@ export class AudioRecorder {
       this.state.isPaused = false
 
       if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+        const stopPromise = new Promise<Blob | null>((resolve) => {
+          this.stopResolver = resolve
+        })
         this.mediaRecorder.stop()
+        return await stopPromise
       }
 
       // 停止音量检测
@@ -184,12 +197,9 @@ export class AudioRecorder {
       // 停止计时器
       this.stopTimer()
 
-      // 生成最终音频文件
       const audioBlob = this.createAudioBlob()
-      
-      this.config.onStop()
-      console.log('停止录制音频，时长:', this.state.duration.toFixed(2), '秒')
-      
+
+      this.finalizeStop(audioBlob)
       return audioBlob
     } catch (error) {
       this.config.onError(error as Error)
@@ -323,7 +333,9 @@ export class AudioRecorder {
     this.mediaRecorder.ondataavailable = (event: BlobEvent) => {
       if (event.data.size > 0) {
         this.state.chunks.push(event.data)
-        this.config.onAudioData(event.data)
+        if (this.config.streaming) {
+          this.config.onAudioData(event.data)
+        }
       }
     }
 
@@ -333,8 +345,24 @@ export class AudioRecorder {
     }
 
     this.mediaRecorder.onstop = () => {
-      // 录制停止后的清理工作已在stop方法中处理
+      const audioBlob = this.createAudioBlob()
+      this.finalizeStop(audioBlob)
     }
+  }
+
+  private finalizeStop(audioBlob: Blob | null): void {
+    if (audioBlob && !this.config.streaming) {
+      this.config.onAudioData(audioBlob)
+    }
+
+    if (this.stopResolver) {
+      const resolve = this.stopResolver
+      this.stopResolver = null
+      resolve(audioBlob)
+    }
+
+    this.config.onStop()
+    console.log('停止录制音频，时长:', this.state.duration.toFixed(2), '秒')
   }
 
   private getSupportedMimeType(): string | null {
@@ -423,8 +451,6 @@ export class AudioRecorder {
   private stopTimer(): void {
     // Timer通过检查状态自动停止
   }
-
-  private onVolumeChange: ((level: number) => void) | null = null
 
   /**
    * 获取设备信息 - 软著申请：音频设备检测

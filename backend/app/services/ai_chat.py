@@ -14,7 +14,8 @@ import uuid
 import numpy as np
 
 from app.config import settings
-from app.services.asr_service import ASRService
+from app.ml_models.qwen_integration import model_manager
+from app.services.asr_service import ASRService, shared_asr_service
 from app.services.audio_utils import AudioUtils
 from app.services.tts_service import TTSService
 
@@ -24,20 +25,18 @@ logger = logging.getLogger(__name__)
 class AIChatService:
     """AI聊天服务类 - 软著申请：对话管理系统"""
     
-    def __init__(self):
+    def __init__(
+        self,
+        asr_service: Optional[ASRService] = None,
+        qwen_processor=None,
+        tts_service: Optional[TTSService] = None,
+    ):
         self.session_contexts = {}  # 会话上下文缓存
-        self.asr_service = ASRService()
+        self.strict_no_fallback = bool(getattr(settings, "strict_no_fallback", True))
+        self.asr_service = asr_service or shared_asr_service
         self.audio_utils = AudioUtils()
-        self.tts_service = TTSService()
-        self.qwen_processor = None
-
-        # Qwen模型缺失依赖时不阻塞服务启动，改为运行时降级。
-        try:
-            from app.ml_models.qwen_integration import QwenAudioProcessor
-
-            self.qwen_processor = QwenAudioProcessor()
-        except Exception as e:
-            logger.warning("Qwen2Audio处理器初始化失败，将跳过模型打分: %s", e)
+        self.tts_service = tts_service or TTSService()
+        self.qwen_processor = qwen_processor or model_manager.get_processor()
         
     async def process_text_message(self, message: str, session_id: str) -> Dict[str, Any]:
         """处理文本消息 - 软著申请：文本对话处理"""
@@ -105,9 +104,14 @@ class AIChatService:
             # 获取会话上下文
             context = self._get_session_context(session_id)
             context["user_responses_count"] = context.get("user_responses_count", 0) + 1
+
+            audio_array = await self.audio_utils.preprocess_audio_chunk(
+                audio_data,
+                prefer_container_decode=True,
+            )
             
             # 1. ASR语音识别
-            transcript = await self._speech_to_text(audio_data)
+            transcript = await self._speech_to_text(audio_data, audio_array=audio_array)
             
             if not transcript:
                 return {
@@ -118,7 +122,11 @@ class AIChatService:
                 }
             
             # 2. 诈骗风险检测
-            fraud_analysis = await self._detect_fraud_indicators(transcript, audio_data)
+            fraud_analysis = await self._detect_fraud_indicators(
+                transcript,
+                audio_data,
+                audio_array=audio_array,
+            )
             
             # 3. 生成AI回复
             ai_response = await self._generate_ai_response(transcript, context, fraud_analysis)
@@ -305,17 +313,31 @@ class AIChatService:
         
         return self.session_contexts[session_id]
     
-    async def _speech_to_text(self, audio_data: bytes) -> Optional[str]:
+    async def _speech_to_text(
+        self,
+        audio_data: bytes,
+        audio_array: Optional[np.ndarray] = None,
+    ) -> Optional[str]:
         """语音转文字 - 软著申请：ASR服务集成"""
 
-        transcript = await self.asr_service.transcribe_audio(audio_data, language="zh")
+        transcript_source = audio_array if audio_array is not None else audio_data
+        transcript = await self.asr_service.transcribe_audio(transcript_source, language="zh")
+        if transcript:
+            return transcript
+
+        transcript = await self.asr_service.transcribe_audio(transcript_source, language=None)
         if transcript:
             return transcript
 
         logger.warning("ASR未返回有效文本")
         return None
 
-    async def _detect_fraud_indicators(self, text: str, audio_data: Optional[bytes] = None) -> Dict[str, Any]:
+    async def _detect_fraud_indicators(
+        self,
+        text: str,
+        audio_data: Optional[bytes] = None,
+        audio_array: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
         """检测诈骗指标 - 软著申请：风险评估算法"""
 
         fraud_keywords = [
@@ -338,13 +360,28 @@ class AIChatService:
         model_confidence = 0.0
 
         if audio_data:
-            audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
-            if audio_array is not None and isinstance(audio_array, np.ndarray) and audio_array.size > 0:
+            if self.qwen_processor is None:
+                if self.strict_no_fallback:
+                    raise RuntimeError("Qwen2Audio处理器不可用，严格模式禁止降级")
+                logger.warning("Qwen2Audio处理器缺失，使用纯文本风险评估")
+                audio_array = None
+            elif audio_array is None:
+                audio_array = await self.audio_utils.preprocess_audio_chunk(
+                    audio_data,
+                    prefer_container_decode=True,
+                )
+
+            if audio_array is None:
+                if self.strict_no_fallback:
+                    raise RuntimeError("音频预处理失败，严格模式禁止跳过音频风控")
+            elif isinstance(audio_array, np.ndarray) and audio_array.size > 0:
                 qwen_result = await self.qwen_processor.analyze_audio(audio_array)
                 model_risk_score = max(0.0, min(100.0, float(qwen_result.get("score", 0.0)) * 100.0))
                 model_indicators = [str(x) for x in qwen_result.get("fraud_indicators", [])]
                 model_backend = getattr(self.qwen_processor, "model_backend", "unknown")
                 model_confidence = float(qwen_result.get("confidence", 0.0))
+            elif self.strict_no_fallback:
+                raise RuntimeError("音频数据无效，严格模式禁止降级")
 
         if text_risk_score > 0 and model_risk_score > 0:
             risk_score = min(100.0, text_risk_score * 0.55 + model_risk_score * 0.45)
@@ -425,7 +462,10 @@ class AIChatService:
         """文字转语音 - 软著申请：TTS服务集成"""
 
         audio_data = await self.tts_service.text_to_speech(text)
+
         if not audio_data:
+            if self.strict_no_fallback:
+                raise RuntimeError("TTS未生成音频，严格模式禁止返回空音频")
             logger.warning("TTS未生成音频")
             return {
                 "url": None,

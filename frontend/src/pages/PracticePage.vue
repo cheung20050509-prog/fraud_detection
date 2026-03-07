@@ -334,6 +334,13 @@ const showSummary = ref(false)
 const sessionSummary = ref<any>(null)
 const currentSessionId = ref('')
 const localAudioUrls = ref<string[]>([])
+const isSendingAudio = ref(false)
+
+const AUDIO_ERROR_BACKOFF_MS = 4000
+const ERROR_DEDUP_WINDOW_MS = 8000
+let audioRetryAfter = 0
+let lastErrorMessage = ''
+let lastErrorTimestamp = 0
 
 // 音频录制相关
 const recorder = ref<AudioRecorder | null>(null)
@@ -443,9 +450,10 @@ const recordingIconClass = computed(() => {
 
 const recordingHint = computed(() => {
   if (!sessionActive.value) return '请先开始陪练会话'
-  if (!isRecording.value) return '点击开始录音'
+  if (isSendingAudio.value || aiThinking.value) return '正在上传并分析录音，请稍候'
+  if (!isRecording.value) return '点击开始录音，再次点击结束并发送'
   if (audioLevel.value > 0.5) return '说话声音过大，请适当远离麦克风'
-  return '正在录音中，点击麦克风可停止并继续发送'
+  return '正在录音中，点击麦克风停止并发送'
 })
 
 const revokeLocalAudioUrls = () => {
@@ -455,12 +463,30 @@ const revokeLocalAudioUrls = () => {
   localAudioUrls.value = []
 }
 
+const pushAssistantErrorOnce = (content: string) => {
+  const now = Date.now()
+  if (content === lastErrorMessage && now - lastErrorTimestamp < ERROR_DEDUP_WINDOW_MS) {
+    return
+  }
+
+  messages.value.push({
+    role: 'assistant',
+    content,
+    timestamp: new Date(),
+  })
+
+  lastErrorMessage = content
+  lastErrorTimestamp = now
+  scrollToBottom()
+}
+
 // 方法
 const initRecorder = async () => {
   try {
     recorder.value = new AudioRecorder({
       sampleRate: 16000,
       channels: 1,
+      streaming: false,
       format: 'audio/webm',
       onAudioData: handleAudioData,
       onError: (error) => {
@@ -486,12 +512,17 @@ const initRecorder = async () => {
 
 const handleAudioData = async (blob: Blob) => {
   if (!sessionActive.value) return
+  if (isSendingAudio.value) return
+
+  const now = Date.now()
+  if (now < audioRetryAfter) {
+    return
+  }
 
   try {
+    isSendingAudio.value = true
     aiThinking.value = true
     const startTime = Date.now()
-    const localAudioUrl = URL.createObjectURL(blob)
-    localAudioUrls.value.push(localAudioUrl)
 
     // 发送音频到后端处理
     const formData = new FormData()
@@ -504,14 +535,20 @@ const handleAudioData = async (blob: Blob) => {
     })
 
     if (!response.ok) {
-      throw new Error('音频处理失败')
+      const detail = await response.text().catch(() => '')
+      throw new Error(detail || `音频处理失败 (${response.status})`)
     }
 
     const result = await response.json()
     const processingTime = Date.now() - startTime
+    audioRetryAfter = 0
+
+    const hasTranscript = Boolean(result.transcript)
+    const localAudioUrl = URL.createObjectURL(blob)
+    localAudioUrls.value.push(localAudioUrl)
 
     // 添加用户消息
-    if (result.transcript) {
+    if (hasTranscript) {
       messages.value.push({
         role: 'user',
         content: result.transcript,
@@ -547,12 +584,13 @@ const handleAudioData = async (blob: Blob) => {
     scrollToBottom()
   } catch (error) {
     console.error('处理音频失败:', error)
-    messages.value.push({
-      role: 'assistant',
-      content: '抱歉，处理您的语音时出现错误，请重试。',
-      timestamp: new Date()
-    })
+
+    // 失败后短暂退避，避免每个录音切片都重复触发错误请求。
+    audioRetryAfter = Date.now() + AUDIO_ERROR_BACKOFF_MS
+
+    pushAssistantErrorOnce('抱歉，处理您的语音时出现错误，请重试。')
   } finally {
+    isSendingAudio.value = false
     aiThinking.value = false
   }
 }
@@ -631,11 +669,19 @@ const toggleRecording = async () => {
     return
   }
 
+  if (isSendingAudio.value || aiThinking.value) {
+    return
+  }
+
   try {
     if (isRecording.value) {
       // 停止录音
-      await recorder.value?.stop()
+      const audioBlob = await recorder.value?.stop()
       stopRecording()
+
+      if (!audioBlob) {
+        pushAssistantErrorOnce('未检测到有效录音，请重试。')
+      }
     } else {
       // 开始录音
       await recorder.value?.start()
@@ -670,6 +716,9 @@ const clearMessages = () => {
   if (confirm('确定要清空所有对话记录吗？')) {
     revokeLocalAudioUrls()
     messages.value = []
+    lastErrorMessage = ''
+    lastErrorTimestamp = 0
+    audioRetryAfter = 0
   }
 }
 
@@ -704,6 +753,7 @@ onMounted(async () => {
 onUnmounted(() => {
   recorder.value?.cleanup()
   revokeLocalAudioUrls()
+  audioRetryAfter = 0
   if (recordingInterval) {
     clearInterval(recordingInterval)
   }

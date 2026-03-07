@@ -289,6 +289,10 @@ export class WebSocketManager {
 
   private startHeartbeat(): void {
     this.clearHeartbeat()
+
+    if (this.config.heartbeatInterval <= 0) {
+      return
+    }
     
     this.heartbeatTimer = window.setInterval(() => {
       if (this.isConnected()) {

@@ -9,7 +9,9 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import logging
+from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, Any
 
@@ -21,6 +23,7 @@ from app.routers.ai_practice import router as ai_practice_router
 from app.routers.monitoring import router as monitoring_router
 from app.routers.analysis import router as analysis_router
 from app.routers.config import router as config_router
+from app.services.monitoring_session_service import monitoring_session_service
 
 import os
 
@@ -127,29 +130,67 @@ async def websocket_audio_endpoint(websocket: WebSocket, mode: str):
     """音频流WebSocket端点 - 软著申请：实时音频流传输核心接口"""
     
     session_id = None
+    session_status = "completed"
     try:
         # 验证模式
         valid_modes = ["practice", "monitoring", "analysis"]
         if mode not in valid_modes:
             raise HTTPException(status_code=400, detail=f"无效模式: {mode}")
+
+        requested_session_id = websocket.query_params.get("session_id")
+        raw_user_id = websocket.query_params.get("user_id")
+        requested_user_id = int(raw_user_id) if raw_user_id and raw_user_id.isdigit() else None
+
+        if mode == "monitoring":
+            if requested_session_id:
+                monitoring_session = monitoring_session_service.ensure_session(
+                    requested_session_id,
+                    user_id=requested_user_id,
+                )
+            else:
+                monitoring_session = monitoring_session_service.create_session(user_id=requested_user_id)
+
+            requested_session_id = monitoring_session["session_id"]
+            requested_user_id = monitoring_session["user_id"]
         
         # 建立连接
-        session_id = await connection_manager.connect(websocket, mode=mode)
+        session_id = await connection_manager.connect(
+            websocket,
+            mode=mode,
+            user_id=str(requested_user_id) if requested_user_id is not None else None,
+            session_id=requested_session_id if mode == "monitoring" else None,
+        )
+
+        if mode == "monitoring":
+            monitoring_session_service.mark_connected(
+                session_id,
+                metadata={
+                    "mode": mode,
+                    "transport": "websocket",
+                },
+            )
         logger.info(f"WebSocket连接建立: {session_id}, 模式: {mode}")
         
         # 根据模式处理消息
         if mode == "practice":
             await handle_practice_mode(session_id, websocket)
         elif mode == "monitoring":
-            await handle_monitoring_mode(session_id, websocket)
+            session_status = await handle_monitoring_mode(session_id, websocket)
         elif mode == "analysis":
             await handle_analysis_mode(session_id, websocket)
             
     except WebSocketDisconnect:
         logger.info(f"WebSocket连接断开: {session_id}")
+    except ValueError as e:
+        session_status = "interrupted"
+        logger.error(f"WebSocket会话校验失败 {session_id}: {e}")
+        await websocket.close(code=1008, reason=str(e))
     except Exception as e:
+        session_status = "interrupted"
         logger.error(f"WebSocket错误 {session_id}: {e}")
     finally:
+        if session_id and mode == "monitoring":
+            monitoring_session_service.complete_session(session_id, status=session_status)
         if session_id:
             await connection_manager.disconnect(session_id)
 
@@ -183,43 +224,105 @@ async def handle_practice_mode(session_id: str, websocket: WebSocket):
             logger.error(f"陪练模式处理错误 {session_id}: {e}")
             break
 
-async def handle_monitoring_mode(session_id: str, websocket: WebSocket):
+async def handle_monitoring_mode(session_id: str, websocket: WebSocket) -> str:
     """处理实时监护模式 - 软著申请：环境音监听和风险检测"""
     
     from app.services.fraud_detection import FraudDetectionService
     
     detection_service = FraudDetectionService()
+
+    def _is_normal_socket_shutdown(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            isinstance(exc, WebSocketDisconnect)
+            or "WebSocket is not connected" in message
+            or not connection_manager.has_connection(session_id)
+        )
+
+    async def _receive_monitoring_audio() -> bytes | None:
+        message = await websocket.receive()
+        message_type = message.get("type")
+
+        if message_type == "websocket.disconnect":
+            raise WebSocketDisconnect()
+
+        if message_type != "websocket.receive":
+            return None
+
+        text_payload = message.get("text")
+        if isinstance(text_payload, str):
+            is_heartbeat = False
+            try:
+                parsed = json.loads(text_payload)
+                is_heartbeat = isinstance(parsed, dict) and parsed.get("type") == "heartbeat"
+            except json.JSONDecodeError:
+                parsed = None
+
+            if is_heartbeat:
+                await connection_manager.send_message(session_id, {
+                    "type": "pong",
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+            else:
+                logger.info("忽略监护文本帧 %s: %s", session_id, text_payload[:80])
+            return None
+
+        binary_payload = message.get("bytes")
+        if binary_payload is None or len(binary_payload) == 0:
+            return None
+
+        return binary_payload
     
     while True:
         try:
             # 接收音频数据
-            data = await websocket.receive_bytes()
+            data = await _receive_monitoring_audio()
+            if data is None:
+                continue
             
             # 实时风险检测
             risk_result = await detection_service.analyze_audio_chunk(data, session_id)
+            risk_payload = asdict(risk_result)
             
             # 发送检测结果
-            await connection_manager.send_message(session_id, {
+            sent = await connection_manager.send_message(session_id, {
                 "type": "risk_analysis",
-                "data": risk_result,
+                "data": risk_payload,
                 "timestamp": datetime.utcnow().isoformat()
             })
+            if not sent:
+                break
             
             # 如果检测到高风险，触发警报
-            if risk_result.get("risk_score", 0) > settings.risk_threshold_medium:
-                await connection_manager.send_message(session_id, {
+            if risk_payload.get("risk_score", 0) > settings.risk_threshold_medium:
+                sent = await connection_manager.send_message(session_id, {
                     "type": "fraud_alert",
                     "severity": "high",
                     "message": "检测到潜在的诈骗风险！",
-                    "data": risk_result,
+                    "data": risk_payload,
                     "timestamp": datetime.utcnow().isoformat()
                 })
+                if not sent:
+                    return "completed"
             
         except WebSocketDisconnect:
-            break
+            return "completed"
         except Exception as e:
+            if _is_normal_socket_shutdown(e):
+                logger.info(f"监护模式连接正常关闭: {session_id}")
+                return "completed"
+
             logger.error(f"监护模式处理错误 {session_id}: {e}")
-            break
+            if connection_manager.has_connection(session_id):
+                await connection_manager.send_message(session_id, {
+                    "type": "error",
+                    "code": "monitoring_analysis_failed",
+                    "message": str(e),
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+            return "interrupted"
+
+    return "completed"
 
 async def handle_analysis_mode(session_id: str, websocket: WebSocket):
     """处理案例分析模式 - 软著申请：文件上传和离线分析"""
@@ -227,21 +330,21 @@ async def handle_analysis_mode(session_id: str, websocket: WebSocket):
     while True:
         try:
             # 接收文件或分析请求
-            message = await websocket.receive_text()
-            
-            # 处理分析请求
-            # 这里简化处理，实际应调用分析服务
-            await connection_manager.send_message(session_id, {
-                "type": "analysis_status",
-                "status": "processing",
-                "message": "正在分析文件...",
-                "timestamp": datetime.utcnow().isoformat()
-            })
+            await websocket.receive_text()
+
+            # 严格模式下禁止返回模拟进度状态。
+            raise RuntimeError("分析模式WebSocket尚未接入真实离线分析流水线")
             
         except WebSocketDisconnect:
             break
         except Exception as e:
             logger.error(f"分析模式处理错误 {session_id}: {e}")
+            await connection_manager.send_message(session_id, {
+                "type": "error",
+                "code": "analysis_pipeline_unavailable",
+                "message": str(e),
+                "timestamp": datetime.utcnow().isoformat(),
+            })
             break
 
 # REST API路由

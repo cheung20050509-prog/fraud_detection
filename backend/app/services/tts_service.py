@@ -25,6 +25,7 @@ class TTSService:
     def __init__(self):
         """初始化TTS服务"""
         self.audio_utils = AudioUtils()
+        self.strict_no_fallback = bool(getattr(settings, "strict_no_fallback", True))
         
         # TTS配置
         self.default_voice = "zh-CN-XiaoxiaoNeural"
@@ -73,12 +74,17 @@ class TTSService:
             if audio_data:
                 logger.info(f"TTS合成成功: {len(text)}字符, 语音: {voice}")
                 return audio_data
-            else:
-                # 降级到Mock
-                return await self._mock_tts_synthesize(text, voice)
+
+            if self.strict_no_fallback:
+                raise RuntimeError("TTS引擎不可用，严格模式禁止降级到Mock")
+
+            # 降级到Mock
+            return await self._mock_tts_synthesize(text, voice)
             
         except Exception as e:
             logger.error(f"TTS合成失败: {e}")
+            if self.strict_no_fallback:
+                raise
             return await self._mock_tts_synthesize(text, voice)
     
     async def _edge_tts_synthesize(self, text: str, voice: str, 
@@ -87,13 +93,17 @@ class TTSService:
         
         try:
             import edge_tts
+
+            rate_pct = int(round((speed - 1.0) * 100))
+            volume_pct = int(round((volume - 1.0) * 100))
             
             # 创建TTS通信
-            communicate = edge_tts.Communicate(text, voice=voice)
-            
-            # 设置语音参数
-            communicate.props["rate"] = f"{speed:+.0f}%"
-            communicate.props["volume"] = f"{volume:+.0f}%"
+            communicate = edge_tts.Communicate(
+                text,
+                voice=voice,
+                rate=f"{rate_pct:+d}%",
+                volume=f"{volume_pct:+d}%",
+            )
             
             # 生成音频
             audio_data = b""
@@ -104,10 +114,14 @@ class TTSService:
             
             return audio_data if audio_data else None
             
-        except ImportError:
+        except ImportError as e:
+            if self.strict_no_fallback:
+                raise RuntimeError("edge_tts库未安装，严格模式禁止降级") from e
             logger.warning("edge_tts库未安装，使用Mock TTS")
             return None
         except Exception as e:
+            if self.strict_no_fallback:
+                raise RuntimeError(f"EdgeTTS合成失败: {e}") from e
             logger.error(f"EdgeTTS合成失败: {e}")
             return None
     
@@ -264,11 +278,15 @@ class TTSService:
             
             return voice_dict
             
-        except ImportError:
+        except ImportError as e:
+            if self.strict_no_fallback:
+                raise RuntimeError("edge_tts库未安装，严格模式不返回Mock语音列表") from e
             logger.warning("edge_tts库未安装，返回Mock语音列表")
             return self.available_voices
         except Exception as e:
             logger.error(f"获取语音列表失败: {e}")
+            if self.strict_no_fallback:
+                raise
             return self.available_voices
     
     async def save_audio_to_file(self, audio_data: bytes, filename: str = None) -> str:

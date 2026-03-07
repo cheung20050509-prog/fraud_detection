@@ -6,11 +6,8 @@ ASR服务 - 软著申请：语音识别转录服务
 import asyncio
 import logging
 import numpy as np
-from typing import Optional, Dict, Any
-import librosa
+from typing import Optional, Dict, Any, Union
 from datetime import datetime
-import io
-import wave
 
 from app.config import settings
 from app.services.audio_utils import AudioUtils
@@ -26,6 +23,10 @@ def _schedule_background_task(coro) -> bool:
         loop.create_task(coro)
         return True
     except RuntimeError:
+        try:
+            coro.close()
+        except Exception:
+            pass
         return False
 
 class ASRService:
@@ -36,6 +37,8 @@ class ASRService:
         self.whisper_processor = None
         self.audio_utils = AudioUtils()
         self._init_lock = asyncio.Lock()
+        self._init_error: Optional[str] = None
+        self.strict_no_fallback = bool(getattr(settings, "strict_no_fallback", True))
         
         # ASR配置
         self.model_size = settings.whisper_model_size
@@ -62,7 +65,9 @@ class ASRService:
 
                     if self.use_cuda and torch.cuda.is_available():
                         device = "cuda"
-                except Exception:
+                except Exception as e:
+                    if self.strict_no_fallback:
+                        raise RuntimeError(f"torch不可用，严格模式禁止降级: {e}") from e
                     logger.warning("torch不可用，ASR将使用CPU或降级方案")
 
                 from app.ml_models.whisper_integration import WhisperProcessor
@@ -71,24 +76,54 @@ class ASRService:
                     model_size=self.model_size,
                     device=device,
                 )
+                self._init_error = None
                 logger.info("Whisper模型初始化完成")
             except Exception as e:
                 logger.error(f"Whisper模型初始化失败: {e}")
-                # 创建Mock处理器作为降级方案
-                self.whisper_processor = MockWhisperProcessor()
+                self._init_error = str(e)
+                if self.strict_no_fallback:
+                    self.whisper_processor = None
+                else:
+                    # 创建Mock处理器作为降级方案
+                    self.whisper_processor = MockWhisperProcessor()
 
     async def _ensure_initialized(self):
         """确保模型已初始化。"""
 
         if self.whisper_processor is None:
             await self._init_models()
+
+        if self.whisper_processor is None:
+            raise RuntimeError(f"Whisper处理器不可用: {self._init_error or '初始化失败'}")
+
+        backend = getattr(self.whisper_processor, "model_backend", None)
+        if self.strict_no_fallback and backend == "mock":
+            raise RuntimeError("Whisper当前为Mock后端，严格模式禁止降级")
+
+    async def warmup_model(self):
+        """预热Whisper模型，避免并发初始化导致不稳定状态。"""
+
+        await self._ensure_initialized()
+
+        if self.whisper_processor is None:
+            raise RuntimeError("Whisper处理器不可用")
+
+        init_method = getattr(self.whisper_processor, "_async_init", None)
+        if callable(init_method):
+            await init_method()
+
+        backend = getattr(self.whisper_processor, "model_backend", None)
+        init_error = getattr(self.whisper_processor, "_init_error", None)
+
+        if self.strict_no_fallback and backend != "real":
+            raise RuntimeError(f"Whisper不可用: {init_error or backend or '模型未就绪'}")
     
-    async def transcribe_audio(self, audio_data: bytes, language: str = "zh") -> Optional[str]:
+    async def transcribe_audio(self, audio_data: Union[bytes, np.ndarray], language: str = "zh") -> Optional[str]:
         """
         转录音频 - 软著申请：语音识别核心功能
         
         Args:
-            audio_data: 音频二进制数据
+            audio_data: 音频二进制数据或浮点音频数组
             language: 语言代码 (zh/en/ja等)
             
         Returns:
@@ -98,14 +133,21 @@ class ASRService:
         try:
             await self._ensure_initialized()
 
-            if not audio_data or len(audio_data) < 100:
-                logger.warning("音频数据为空或过短")
-                return None
-            
-            # 音频预处理
-            audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
-            if audio_array is None:
-                logger.warning("音频预处理失败")
+            if isinstance(audio_data, np.ndarray):
+                audio_array = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+            else:
+                if not audio_data or len(audio_data) < 100:
+                    logger.warning("音频数据为空或过短")
+                    return None
+
+                # 音频预处理
+                audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
+                if audio_array is None:
+                    logger.warning("音频预处理失败")
+                    return None
+
+            if audio_array is None or len(audio_array) == 0:
+                logger.warning("音频数据为空")
                 return None
             
             # 检查音频长度
@@ -124,9 +166,11 @@ class ASRService:
             
         except Exception as e:
             logger.error(f"音频转录失败: {e}")
+            if self.strict_no_fallback:
+                raise
             return None
     
-    async def transcribe_with_timestamp(self, audio_data: bytes, 
+    async def transcribe_with_timestamp(self, audio_data: Union[bytes, np.ndarray], 
                                       language: str = "zh") -> Dict[str, Any]:
         """
         带时间戳的音频转录 - 软著申请：详细语音分析功能
@@ -143,7 +187,10 @@ class ASRService:
             transcript = await self.transcribe_audio(audio_data, language)
             
             # 计算音频时长
-            audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
+            if isinstance(audio_data, np.ndarray):
+                audio_array = np.asarray(audio_data, dtype=np.float32).reshape(-1)
+            else:
+                audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
             duration = len(audio_array) / self.sample_rate if audio_array is not None else 0
             
             return {
@@ -157,6 +204,8 @@ class ASRService:
             
         except Exception as e:
             logger.error(f"带时间戳转录失败: {e}")
+            if self.strict_no_fallback:
+                raise
             return {
                 "text": "",
                 "language": language,
@@ -197,6 +246,8 @@ class ASRService:
             
         except Exception as e:
             logger.error(f"流式转录失败: {e}")
+            if self.strict_no_fallback:
+                raise
             return ""
     
     async def detect_language(self, audio_data: bytes) -> str:
@@ -214,6 +265,8 @@ class ASRService:
             await self._ensure_initialized()
 
             if not self.whisper_processor:
+                if self.strict_no_fallback:
+                    raise RuntimeError("Whisper处理器未初始化")
                 return "zh"  # 默认中文
             
             audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
@@ -226,6 +279,8 @@ class ASRService:
             
         except Exception as e:
             logger.error(f"语言检测失败: {e}")
+            if self.strict_no_fallback:
+                raise
             return "zh"
     
     def is_speech_present(self, audio_data: bytes) -> bool:
@@ -292,6 +347,9 @@ class MockWhisperProcessor:
         """Mock语言检测"""
         await asyncio.sleep(0.05)
         return "zh"  # 默认返回中文
+
+
+shared_asr_service = ASRService()
 
 
 # 语音活动检测 (VAD) 辅助类

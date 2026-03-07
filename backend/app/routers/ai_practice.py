@@ -16,6 +16,29 @@ from pydantic import BaseModel
 router = APIRouter()
 ai_chat_service = AIChatService()
 
+
+def _raise_chat_service_error(error_text: str):
+    """将服务层错误映射为更合适的HTTP状态码。"""
+
+    message = error_text or "服务处理失败"
+    lowered = message.lower()
+    dependency_keywords = [
+        "严格模式",
+        "不可用",
+        "初始化失败",
+        "禁止降级",
+        "not available",
+        "not installed",
+        "dependency",
+        "qwen",
+        "whisper",
+        "edge_tts",
+        "tts",
+    ]
+
+    status_code = 503 if any(keyword in lowered for keyword in dependency_keywords) else 500
+    raise HTTPException(status_code=status_code, detail=message)
+
 # Pydantic模型
 class PracticeSessionCreate(BaseModel):
     """创建陪练会话请求模型"""
@@ -55,7 +78,7 @@ async def start_practice_session(session_data: PracticeSessionStartRequest):
     )
 
     if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
+        _raise_chat_service_error(result["error"])
 
     return {
         "session_id": result.get("session_id"),
@@ -71,7 +94,7 @@ async def end_practice_session(session_data: PracticeSessionEndRequest):
 
     result = await ai_chat_service.end_practice_session(session_data.session_id)
     if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
+        _raise_chat_service_error(result["error"])
 
     summary = result.get("summary", {})
     total_messages = int(summary.get("total_messages", 0))
@@ -110,7 +133,7 @@ async def process_practice_audio(
 
     result = await ai_chat_service.process_audio_message(audio_data, session_id)
     if result.get("error"):
-        raise HTTPException(status_code=500, detail=result["error"])
+        _raise_chat_service_error(result["error"])
 
     fraud_analysis = result.get("fraud_analysis", {})
     indicators = fraud_analysis.get("indicators", {})

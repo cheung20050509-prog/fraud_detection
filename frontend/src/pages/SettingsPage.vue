@@ -59,7 +59,6 @@
                         class="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-transparent">
                   <option value="local">本地模型</option>
                   <option value="official">官方API</option>
-                  <option value="mock">模拟模式</option>
                 </select>
               </div>
 

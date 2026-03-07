@@ -4,13 +4,21 @@
 """
 
 import asyncio
+import importlib
 import logging
+import os
 import numpy as np
 import wave
 import io
+import shutil
+import subprocess
 from typing import Optional, Dict, Any, Tuple
-import librosa
 from datetime import datetime
+
+try:
+    librosa = importlib.import_module("librosa")
+except Exception:  # pragma: no cover
+    librosa = None
 
 from app.config import settings
 
@@ -24,12 +32,17 @@ class AudioUtils:
         self.sample_rate = settings.audio_sample_rate
         self.channels = settings.audio_channels
         self.chunk_size = settings.audio_chunk_size
+        self.ffmpeg_bin = self._resolve_ffmpeg_bin()
         
         # 音频处理参数
         self.vad_threshold = settings.vad_threshold
         self.max_duration = settings.max_speech_duration
     
-    async def preprocess_audio_chunk(self, audio_data: bytes) -> Optional[np.ndarray]:
+    async def preprocess_audio_chunk(
+        self,
+        audio_data: bytes,
+        prefer_container_decode: bool = False,
+    ) -> Optional[np.ndarray]:
         """
         音频块预处理 - 软著申请：音频流预处理
         
@@ -50,23 +63,16 @@ class AudioUtils:
             # 1. 尝试WAV格式
             if audio_data.startswith(b'RIFF'):
                 audio_array = self._read_wav_from_bytes(audio_data)
+            elif prefer_container_decode and self._looks_like_encoded_audio(audio_data):
+                audio_array = await asyncio.to_thread(self._decode_with_ffmpeg, audio_data)
             
-            # 2. 尝试PCM格式（16位）
-            elif len(audio_data) % 2 == 0:
-                try:
-                    # 假设是16位PCM
-                    audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
-                    audio_array = audio_array / 32768.0  # 归一化到[-1, 1]
-                except:
-                    pass
-            
-            # 3. 尝试8位PCM
-            else:
-                try:
-                    audio_array = np.frombuffer(audio_data, dtype=np.uint8).astype(np.float32)
-                    audio_array = (audio_array - 128) / 128.0  # 归一化到[-1, 1]
-                except:
-                    pass
+            # 2. 尝试PCM格式（16位/8位）
+            if audio_array is None:
+                audio_array = self._read_pcm_from_bytes(audio_data)
+
+            # 3. 容器音频的兜底解码
+            if audio_array is None and prefer_container_decode:
+                audio_array = await asyncio.to_thread(self._decode_with_ffmpeg, audio_data)
             
             if audio_array is None:
                 logger.warning("无法解析音频格式")
@@ -85,6 +91,99 @@ class AudioUtils:
         except Exception as e:
             logger.error(f"音频预处理失败: {e}")
             return None
+
+    def _resolve_ffmpeg_bin(self) -> Optional[str]:
+        """解析ffmpeg可执行文件路径。"""
+
+        candidates = [
+            os.environ.get("FFMPEG_BIN"),
+            os.path.join(os.environ.get("CONDA_PREFIX", ""), "bin", "ffmpeg") if os.environ.get("CONDA_PREFIX") else None,
+            "/root/autodl-tmp/fraud_detection/bin/ffmpeg",
+            shutil.which("ffmpeg"),
+        ]
+
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+
+        return None
+
+    def _looks_like_encoded_audio(self, audio_data: bytes) -> bool:
+        """检测是否为浏览器常见的容器音频格式。"""
+
+        if audio_data.startswith(b"\x1a\x45\xdf\xa3"):
+            return True
+        if audio_data.startswith(b"OggS"):
+            return True
+        if len(audio_data) >= 8 and audio_data[4:8] == b"ftyp":
+            return True
+        if audio_data.startswith(b"ID3"):
+            return True
+        if len(audio_data) >= 2 and audio_data[0] == 0xFF and (audio_data[1] & 0xF0) == 0xF0:
+            return True
+        return False
+
+    def _read_pcm_from_bytes(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """按原始PCM字节读取音频。"""
+
+        try:
+            if len(audio_data) % 2 == 0:
+                audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+                return audio_array / 32768.0
+
+            audio_array = np.frombuffer(audio_data, dtype=np.uint8).astype(np.float32)
+            return (audio_array - 128) / 128.0
+        except Exception:
+            return None
+
+    def _decode_with_ffmpeg(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """使用ffmpeg将容器音频解码为16k单声道PCM。"""
+
+        if not self.ffmpeg_bin:
+            return None
+
+        try:
+            command = [
+                self.ffmpeg_bin,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "pipe:0",
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                str(self.channels),
+                "-ar",
+                str(self.sample_rate),
+                "pipe:1",
+            ]
+            result = subprocess.run(
+                command,
+                input=audio_data,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=20,
+            )
+        except Exception as e:
+            logger.warning("ffmpeg解码异常: %s", e)
+            return None
+
+        if result.returncode != 0 or not result.stdout:
+            stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+            if stderr:
+                logger.warning("ffmpeg解码失败: %s", stderr)
+            return None
+
+        audio_array = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)
+        if audio_array.size == 0:
+            return None
+
+        return audio_array / 32768.0
     
     def _read_wav_from_bytes(self, wav_data: bytes) -> Optional[np.ndarray]:
         """从字节数据读取WAV文件"""
@@ -139,16 +238,20 @@ class AudioUtils:
             features["spectral_bandwidth"] = np.sqrt(np.sum(((freqs[:len(freqs)//2] - features["spectral_centroid"]) ** 2) * magnitude[:len(magnitude)//2]) / (np.sum(magnitude[:len(magnitude)//2]) + 1e-10))
             
             # 3. MFCC特征
-            try:
+            if librosa is None:
+                features["mfcc_mean"] = 0.0
+                features["mfcc_std"] = 0.0
+            else:
                 mfccs = librosa.feature.mfcc(y=audio_array, sr=self.sample_rate, n_mfcc=13)
                 features["mfcc_mean"] = np.mean(mfccs)
                 features["mfcc_std"] = np.std(mfccs)
-            except:
-                features["mfcc_mean"] = 0.0
-                features["mfcc_std"] = 0.0
             
             # 4. 音高特征
-            try:
+            if librosa is None:
+                features["pitch_mean"] = 0.0
+                features["pitch_std"] = 0.0
+                features["pitch_range"] = 0.0
+            else:
                 pitches, magnitudes = librosa.piptrack(y=audio_array, sr=self.sample_rate)
                 pitch_values = []
                 
@@ -166,11 +269,6 @@ class AudioUtils:
                     features["pitch_mean"] = 0.0
                     features["pitch_std"] = 0.0
                     features["pitch_range"] = 0.0
-                    
-            except:
-                features["pitch_mean"] = 0.0
-                features["pitch_std"] = 0.0
-                features["pitch_range"] = 0.0
             
             # 5. 语速和节奏特征
             features["speech_rate"] = len(audio_array) / self.sample_rate  # 简化的语速估计

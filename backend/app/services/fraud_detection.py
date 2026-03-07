@@ -5,22 +5,17 @@
 
 import asyncio
 import numpy as np
-import torch
-import librosa
 import logging
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass
-import json
-import io
-import wave
-from collections import deque
 
 from app.config import settings
 from app.database.database import get_db
 from app.database.models import MonitoringSession, FraudAlert, DetectionResult
-from app.ml_models.qwen_integration import QwenAudioProcessor
-from app.services.asr_service import ASRService
+from app.ml_models.qwen_integration import QwenAudioProcessor, model_manager
+from app.services.asr_service import ASRService, shared_asr_service
 from app.services.audio_utils import AudioUtils
 
 logger = logging.getLogger(__name__)
@@ -40,10 +35,19 @@ class RiskAnalysis:
 class FraudDetectionService:
     """诈骗检测服务类 - 软著申请：实时诈骗风险检测引擎"""
     
-    def __init__(self):
+    def __init__(
+        self,
+        asr_service: Optional[ASRService] = None,
+        qwen_processor: Optional[QwenAudioProcessor] = None,
+    ):
         """初始化检测服务"""
-        self.qwen_processor = None
-        self.asr_service = ASRService()
+        self.qwen_processor = qwen_processor or model_manager.get_processor()
+        self.strict_no_fallback = bool(getattr(settings, "strict_no_fallback", True))
+        self._initialized = False
+        self._init_error: Optional[str] = None
+        self._init_lock = asyncio.Lock()
+
+        self.asr_service = asr_service or shared_asr_service
         self.audio_utils = AudioUtils()
         
         # 音频缓存队列 - 用于累积音频片段进行分析
@@ -63,20 +67,52 @@ class FraudDetectionService:
             "bait": ["中奖", "退款", "理赔", "补偿", "投资", "理财", "高回报"],
             "impersonation": ["我是", "这里是", "我们公司", "官方通知", "系统检测"]
         }
-        
-        # 初始化AI模型
-        asyncio.create_task(self._init_models())
     
     async def _init_models(self):
         """异步初始化AI模型 - 软著申请：AI模型懒加载优化"""
-        try:
-            logger.info("正在初始化Qwen2Audio模型...")
-            self.qwen_processor = QwenAudioProcessor()
-            logger.info("Qwen2Audio模型初始化完成")
-        except Exception as e:
-            logger.error(f"模型初始化失败: {e}")
-            # 创建Mock处理器作为降级方案
-            self.qwen_processor = MockQwenProcessor()
+        async with self._init_lock:
+            if self._initialized:
+                return
+
+            try:
+                if self.qwen_processor is None:
+                    self.qwen_processor = model_manager.get_processor()
+                if self.qwen_processor is None:
+                    raise RuntimeError("Qwen2Audio处理器不可用")
+
+                self._init_error = getattr(self.qwen_processor, "_init_error", None)
+                self._initialized = True
+            except Exception as e:
+                self.qwen_processor = None
+                self._init_error = str(e)
+                self._initialized = True
+                logger.error("模型初始化失败: %s", e)
+                if self.strict_no_fallback:
+                    raise RuntimeError(f"Qwen2Audio初始化失败: {e}") from e
+
+    async def _ensure_runtime_models_ready(self):
+        """顺序预热模型，避免Whisper/Qwen并发初始化触发meta张量问题。"""
+
+        if self.qwen_processor is None:
+            message = self._init_error or "Qwen2Audio处理器未初始化"
+            if self.strict_no_fallback:
+                raise RuntimeError(message)
+        else:
+            qwen_needs_init = (
+                not bool(getattr(self.qwen_processor, "_initialized", False))
+                or getattr(self.qwen_processor, "model", None) is None
+                or getattr(self.qwen_processor, "processor", None) is None
+            )
+            if qwen_needs_init:
+                await self.qwen_processor._async_init()
+
+            if self.strict_no_fallback:
+                qwen_backend = getattr(self.qwen_processor, "model_backend", "unknown")
+                qwen_error = getattr(self.qwen_processor, "_init_error", None)
+                if qwen_backend != "real":
+                    raise RuntimeError(f"Qwen2Audio不可用: {qwen_error or qwen_backend}")
+
+        await self.asr_service.warmup_model()
     
     async def analyze_audio_chunk(self, audio_data: bytes, session_id: str) -> RiskAnalysis:
         """
@@ -93,9 +129,16 @@ class FraudDetectionService:
         start_time = datetime.now()
         
         try:
+            await self._init_models()
+
             # 1. 音频预处理
-            audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
-            if audio_array is None:
+            audio_array = await self.audio_utils.preprocess_audio_chunk(
+                audio_data,
+                prefer_container_decode=True,
+            )
+            if audio_array is None or len(audio_array) == 0:
+                if self.strict_no_fallback:
+                    raise RuntimeError("音频预处理失败或结果为空")
                 return self._create_empty_analysis(session_id)
             
             # 2. 缓存音频数据
@@ -107,17 +150,21 @@ class FraudDetectionService:
             
             # 4. 获取分析音频片段
             analysis_audio = await self._get_analysis_audio(session_id)
+
+            # 5. 预热模型（串行）并执行分析，避免并发初始化竞态。
+            await self._ensure_runtime_models_ready()
+
+            asr_result = await self._asr_transcription(analysis_audio, session_id)
+            transcript_text = asr_result.get("transcript") if isinstance(asr_result, dict) else ""
             
-            # 5. 并行执行多种分析 - 软著申请：多模态融合分析
+            # 并行执行其余分析 - 软著申请：多模态融合分析
             tasks = [
                 self._qwen_analysis(analysis_audio, session_id),
-                self._asr_transcription(analysis_audio, session_id),
-                self._keyword_detection(analysis_audio, session_id),
+                self._keyword_detection(analysis_audio, session_id, transcript=transcript_text),
                 self._voice_analysis(analysis_audio, session_id)
             ]
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            qwen_result, asr_result, keyword_result, voice_result = results
+
+            qwen_result, keyword_result, voice_result = await asyncio.gather(*tasks)
             
             # 6. 融合分析结果 - 软著申请：多算法结果融合算法
             risk_analysis = await self._fuse_analysis_results(
@@ -143,40 +190,68 @@ class FraudDetectionService:
             return risk_analysis
             
         except Exception as e:
-            logger.error(f"音频分析失败 {session_id}: {e}")
+            logger.error("音频分析失败 %s: %s", session_id, e, exc_info=True)
+            if self.strict_no_fallback:
+                raise RuntimeError(f"音频分析失败: {e}") from e
             return self._create_error_analysis(session_id, str(e))
     
     async def _qwen_analysis(self, audio_array: np.ndarray, session_id: str) -> Dict[str, Any]:
         """Qwen2Audio模型分析 - 软著申请：深度学习音频理解"""
         
         if not self.qwen_processor:
+            message = self._init_error or "Qwen2Audio处理器未初始化"
+            if self.strict_no_fallback:
+                raise RuntimeError(message)
             return {"score": 0.0, "features": {}, "confidence": 0.0}
         
         try:
             # 调用Qwen2Audio模型
             result = await self.qwen_processor.analyze_audio(audio_array)
+            if not isinstance(result, dict):
+                raise RuntimeError("Qwen2Audio返回结果格式无效")
             return result
         except Exception as e:
             logger.error(f"Qwen分析失败 {session_id}: {e}")
+            if self.strict_no_fallback:
+                raise RuntimeError(f"Qwen分析失败: {e}") from e
             return {"score": 0.0, "features": {}, "confidence": 0.0}
     
     async def _asr_transcription(self, audio_array: np.ndarray, session_id: str) -> Dict[str, Any]:
         """语音转文字 - 软著申请：语音识别转录服务"""
         
         try:
-            transcript = await self.asr_service.transcribe_audio(audio_array)
-            return {"transcript": transcript, "confidence": 0.8}
+            transcript = await self.asr_service.transcribe_audio(audio_array, language="zh")
+            if transcript:
+                return {"transcript": transcript, "confidence": 0.8, "language": "zh"}
+
+            transcript = await self.asr_service.transcribe_audio(audio_array, language=None)
+            if transcript:
+                return {"transcript": transcript, "confidence": 0.7, "language": "auto"}
+
+            duration = float(len(audio_array) / max(1, settings.audio_sample_rate))
+            logger.info("监护ASR未识别到清晰文本 %s: audio_duration=%.2fs", session_id, duration)
+            return {"transcript": "", "confidence": 0.0, "language": None}
         except Exception as e:
             logger.error(f"ASR转录失败 {session_id}: {e}")
+            if self.strict_no_fallback:
+                raise RuntimeError(f"ASR转录失败: {e}") from e
             return {"transcript": "", "confidence": 0.0}
     
-    async def _keyword_detection(self, audio_array: np.ndarray, session_id: str) -> Dict[str, Any]:
+    async def _keyword_detection(
+        self,
+        audio_array: np.ndarray,
+        session_id: str,
+        transcript: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """诈骗关键词检测 - 软著申请：基于规则的诈骗模式识别"""
         
         try:
-            # 先进行ASR转录
-            asr_result = await self._asr_transcription(audio_array, session_id)
-            transcript = asr_result.get("transcript", "")
+            if transcript is None:
+                # 回退路径：单独执行关键词检测时，内部完成ASR。
+                asr_result = await self._asr_transcription(audio_array, session_id)
+                transcript = asr_result.get("transcript", "")
+
+            transcript = transcript or ""
             
             detected_keywords = []
             keyword_score = 0.0
@@ -195,6 +270,8 @@ class FraudDetectionService:
             }
         except Exception as e:
             logger.error(f"关键词检测失败 {session_id}: {e}")
+            if self.strict_no_fallback:
+                raise RuntimeError(f"关键词检测失败: {e}") from e
             return {"detected_keywords": [], "keyword_score": 0.0, "matched_categories": []}
     
     async def _voice_analysis(self, audio_array: np.ndarray, session_id: str) -> Dict[str, Any]:
@@ -203,6 +280,8 @@ class FraudDetectionService:
         try:
             # 提取音频特征
             features = await self.audio_utils.extract_voice_features(audio_array)
+            if self.strict_no_fallback and not features:
+                raise RuntimeError("语音特征为空，严格模式禁止继续融合")
             
             # 分析异常特征
             urgency_score = self._analyze_urgency_from_voice(features)
@@ -215,12 +294,25 @@ class FraudDetectionService:
             }
         except Exception as e:
             logger.error(f"语音分析失败 {session_id}: {e}")
+            if self.strict_no_fallback:
+                raise RuntimeError(f"语音特征提取失败: {e}") from e
             return {"urgency_score": 0.0, "manipulation_score": 0.0, "voice_features": {}}
     
     async def _fuse_analysis_results(self, qwen_result: Dict, asr_result: Dict, 
                                     keyword_result: Dict, voice_result: Dict, 
                                     session_id: str) -> RiskAnalysis:
         """融合分析结果 - 软著申请：多算法加权融合算法"""
+
+        if self.strict_no_fallback:
+            input_map = {
+                "qwen_result": qwen_result,
+                "asr_result": asr_result,
+                "keyword_result": keyword_result,
+                "voice_result": voice_result,
+            }
+            invalid_inputs = [name for name, payload in input_map.items() if not isinstance(payload, dict)]
+            if invalid_inputs:
+                raise RuntimeError(f"融合输入结果格式非法: {', '.join(invalid_inputs)}")
         
         # 权重配置 - 软著申请：多算法动态权重分配
         weights = {
@@ -233,8 +325,9 @@ class FraudDetectionService:
         # 计算各项得分
         qwen_score = qwen_result.get("score", 0.0) * 100
         keyword_score = keyword_result.get("keyword_score", 0.0)
-        voice_score = (voice_result.get("urgency_score", 0.0) + 
-                      voice_result.get("manipulation_score", 0.0)) * 20
+        urgency_score = voice_result.get("urgency_score", 0.0)
+        manipulation_score = voice_result.get("manipulation_score", 0.0)
+        voice_score = (urgency_score + manipulation_score) * 20
         
         # 加权融合
         final_score = (
@@ -271,6 +364,8 @@ class FraudDetectionService:
                 "qwen_score": qwen_score,
                 "keyword_score": keyword_score,
                 "voice_score": voice_score,
+                "urgency_score": urgency_score,
+                "manipulation_score": manipulation_score,
                 "matched_categories": keyword_result.get("matched_categories", [])
             },
             alert_triggered=final_score >= settings.risk_threshold_medium
@@ -339,10 +434,10 @@ class FraudDetectionService:
     
     async def _save_detection_result(self, session_id: str, analysis: RiskAnalysis):
         """保存检测结果到数据库"""
-        
+
+        db_gen = get_db()
+        db = next(db_gen)
         try:
-            db = next(get_db())
-            
             # 创建检测结果记录
             detection = DetectionResult(
                 session_id=session_id,
@@ -357,22 +452,43 @@ class FraudDetectionService:
                 processing_time_ms=analysis.processing_time_ms,
                 model_version="Qwen2Audio-v1.0"
             )
-            
+
             db.add(detection)
+
+            monitoring_session = db.query(MonitoringSession).filter(
+                MonitoringSession.session_id == session_id
+            ).first()
+            if monitoring_session:
+                monitoring_session.max_risk_score = max(
+                    monitoring_session.max_risk_score or 0.0,
+                    analysis.risk_score,
+                )
+                session_data = dict(monitoring_session.session_data or {})
+                session_data["last_analysis_at"] = datetime.utcnow().isoformat()
+                session_data["last_risk_level"] = analysis.risk_level
+                if analysis.transcript:
+                    session_data["last_transcript"] = analysis.transcript[:200]
+                monitoring_session.session_data = session_data
+
             db.commit()
-            
+
         except Exception as e:
+            db.rollback()
             logger.error(f"保存检测结果失败 {session_id}: {e}")
+            if self.strict_no_fallback:
+                raise RuntimeError(f"保存检测结果失败: {e}") from e
+        finally:
+            db_gen.close()
     
     async def _check_alert_conditions(self, session_id: str, analysis: RiskAnalysis):
         """检查警报条件"""
         
         if not analysis.alert_triggered:
             return
-        
+
+        db_gen = get_db()
+        db = next(db_gen)
         try:
-            db = next(get_db())
-            
             # 创建警报表
             alert = FraudAlert(
                 session_id=session_id,
@@ -387,22 +503,27 @@ class FraudDetectionService:
                     "features": analysis.features
                 }
             )
-            
+
             db.add(alert)
             db.commit()
-            
+
             # 更新监听会话的警报计数
             session = db.query(MonitoringSession).filter(
                 MonitoringSession.session_id == session_id
             ).first()
-            
+
             if session:
                 session.risk_alerts_triggered += 1
                 session.max_risk_score = max(session.max_risk_score, analysis.risk_score)
                 db.commit()
-            
+
         except Exception as e:
+            db.rollback()
             logger.error(f"创建警报失败 {session_id}: {e}")
+            if self.strict_no_fallback:
+                raise RuntimeError(f"创建警报失败: {e}") from e
+        finally:
+            db_gen.close()
     
     def _analyze_urgency_from_voice(self, features: Dict) -> float:
         """从语音特征分析紧急性"""
@@ -468,21 +589,3 @@ class FraudDetectionService:
             )
         
         return self._create_empty_analysis(session_id)
-
-
-class MockQwenProcessor:
-    """Mock Qwen处理器 - 用于模型加载失败时的降级方案"""
-    
-    async def analyze_audio(self, audio_array: np.ndarray) -> Dict[str, Any]:
-        """Mock音频分析"""
-        import random
-        
-        # 生成Mock结果
-        return {
-            "score": random.uniform(0.1, 0.3),  # 较低的随机分数
-            "features": {
-                "speech_activity": random.uniform(0.5, 1.0),
-                "emotion": "neutral"
-            },
-            "confidence": 0.5
-        }

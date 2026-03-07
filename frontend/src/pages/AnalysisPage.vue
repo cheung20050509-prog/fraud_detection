@@ -290,8 +290,12 @@ const uploadingFileSize = ref(0)
 const uploadStatus = ref<'idle' | 'dragging' | 'uploading' | 'success' | 'error'>('idle')
 const analysisResult = ref<any>(null)
 const analysisHistory = ref<Array<any>>([])
+const currentAnalysisId = ref('')
 
 const fileInput = ref<HTMLInputElement>()
+
+const ANALYSIS_POLL_INTERVAL_MS = 1200
+const ANALYSIS_TIMEOUT_MS = 180000
 
 // 触发文件选择
 const triggerFileInput = () => {
@@ -465,12 +469,7 @@ const handleFile = async (file: File) => {
   uploadingFileSize.value = file.size
 
   try {
-    // 模拟上传进度
-    const progressInterval = setInterval(() => {
-      if (uploadProgress.value < 90) {
-        uploadProgress.value += 10
-      }
-    }, 200)
+    uploadProgress.value = 15
 
     // 创建FormData
     const formData = new FormData()
@@ -482,17 +481,43 @@ const handleFile = async (file: File) => {
       body: formData
     })
 
-    clearInterval(progressInterval)
-    uploadProgress.value = 100
-
     if (!response.ok) {
-      throw new Error('上传失败')
+      const detail = await response.text()
+      throw new Error(detail || '上传失败')
     }
 
-    const result = await response.json()
-    
-    // 分析文件
-    await analyzeFile(result.file_id, file.name, file.size, file.type)
+    uploadProgress.value = 45
+
+    const uploadResult = await response.json()
+    const analysisId = uploadResult.analysis_id
+    if (!analysisId) {
+      throw new Error('后端未返回analysis_id')
+    }
+    currentAnalysisId.value = analysisId
+
+    uploadProgress.value = 60
+
+    // 轮询获取分析结果
+    const analysisPayload = await pollAnalysisResult(analysisId)
+    uploadProgress.value = 90
+
+    // 映射为前端展示模型
+    const normalized = mapBackendResultToUI(analysisPayload, {
+      fileName: file.name,
+      fileSize: file.size,
+      fileType: file.type,
+      analyzedAt: new Date()
+    })
+
+    analysisResult.value = normalized
+    analysisHistory.value.unshift(normalized)
+
+    if (analysisHistory.value.length > 20) {
+      analysisHistory.value = analysisHistory.value.slice(0, 20)
+    }
+
+    localStorage.setItem('analysisHistory', JSON.stringify(analysisHistory.value))
+    uploadProgress.value = 100
     
     uploadStatus.value = 'success'
     setTimeout(() => {
@@ -530,42 +555,99 @@ const validateFile = (file: File): boolean => {
   return true
 }
 
-const analyzeFile = async (fileId: string, fileName: string, fileSize: number, fileType: string) => {
-  try {
-    const response = await fetch('/api/analysis/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_id: fileId })
-    })
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+const pollAnalysisResult = async (analysisId: string) => {
+  const startedAt = Date.now()
+
+  while (Date.now() - startedAt < ANALYSIS_TIMEOUT_MS) {
+    const response = await fetch(`/api/analysis/results/${analysisId}`)
     if (!response.ok) {
-      throw new Error('分析失败')
+      const detail = await response.text()
+      throw new Error(detail || '获取分析结果失败')
     }
 
-    const result = await response.json()
-    
-    // 添加文件信息
-    result.fileName = fileName
-    result.fileSize = fileSize
-    result.fileType = fileType
-    result.analyzedAt = new Date()
-    
-    analysisResult.value = result
-    
-    // 添加到历史记录
-    analysisHistory.value.unshift(result)
-    
-    // 限制历史记录数量
-    if (analysisHistory.value.length > 20) {
-      analysisHistory.value = analysisHistory.value.slice(0, 20)
+    const payload = await response.json()
+    const status = payload.status
+
+    if (status === 'completed') {
+      return payload
     }
-    
-    // 保存到localStorage
-    localStorage.setItem('analysisHistory', JSON.stringify(analysisHistory.value))
-    
-  } catch (error) {
-    console.error('文件分析失败:', error)
-    alert('分析失败，请重试')
+
+    if (status === 'failed') {
+      throw new Error(payload.error || '后端分析任务失败')
+    }
+
+    uploadProgress.value = Math.min(95, uploadProgress.value + 3)
+    await wait(ANALYSIS_POLL_INTERVAL_MS)
+  }
+
+  throw new Error('分析超时，请稍后重试')
+}
+
+const mapBackendResultToUI = (
+  payload: any,
+  fileMeta: { fileName: string; fileSize: number; fileType: string; analyzedAt: Date }
+) => {
+  const results = payload?.results || {}
+  const fraudDetection = results?.fraud_detection || {}
+  const voiceAnalysis = results?.voice_analysis || {}
+  const transcription = results?.transcription || {}
+  const keyFeatureRaw = results?.key_features || {}
+
+  const riskScore = Math.round(Number(fraudDetection.risk_score || 0))
+  const fraudTypesRaw = Array.isArray(fraudDetection.fraud_types) ? fraudDetection.fraud_types : []
+  const fraudIndicators = Array.isArray(fraudDetection.fraud_indicators) ? fraudDetection.fraud_indicators : []
+
+  const fraudTypeIconMap: Record<string, any> = {
+    authority: UserCheck,
+    urgency: Phone,
+    money: DollarSign,
+    threat: AlertTriangle,
+    bait: Shield,
+    normal: Shield,
+  }
+
+  const fraudTypes = fraudTypesRaw.map((item: any) => {
+    const typeKey = String(item?.type || '').toLowerCase()
+    return {
+      name: item?.name || typeKey || '未知类型',
+      confidence: Math.round(Number(item?.confidence || 0)),
+      icon: fraudTypeIconMap[typeKey] || AlertTriangle,
+    }
+  })
+
+  const keyFeatures = [
+    ...fraudIndicators.map((item: string) => ({
+      name: item,
+      severity: riskScore >= 70 ? 'high' : riskScore >= 40 ? 'medium' : 'low',
+      severityText: riskScore >= 70 ? '高风险' : riskScore >= 40 ? '中风险' : '低风险',
+      description: '在转录文本中检测到的可疑话术特征',
+    })),
+    {
+      name: '模型综合评分',
+      severity: riskScore >= 70 ? 'high' : riskScore >= 40 ? 'medium' : 'low',
+      severityText: riskScore >= 70 ? '高风险' : riskScore >= 40 ? '中风险' : '低风险',
+      description: `综合风险分 ${riskScore}，风险等级 ${fraudDetection.risk_level || 'low'}`,
+    },
+  ]
+
+  return {
+    analysisId: payload?.analysis_id,
+    status: payload?.status,
+    processingTime: Math.round(Number(payload?.processing_time_ms || 0)),
+    riskScore,
+    riskLevel: fraudDetection.risk_level || 'low',
+    fraudTypes,
+    keyFeatures,
+    transcript: transcription?.text || '',
+    suggestions: Array.isArray(results?.suggestions) ? results.suggestions : [],
+    voiceAnalysis,
+    keyFeatureRaw,
+    fileName: fileMeta.fileName,
+    fileSize: fileMeta.fileSize,
+    fileType: fileMeta.fileType,
+    analyzedAt: fileMeta.analyzedAt,
   }
 }
 
@@ -604,8 +686,11 @@ const formatFileSize = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
 
-const formatDateTime = (date: Date): string => {
-  return date.toLocaleString('zh-CN', {
+const formatDateTime = (date: Date | string): string => {
+  const parsed = date instanceof Date ? date : new Date(date)
+  if (Number.isNaN(parsed.getTime())) return '-'
+
+  return parsed.toLocaleString('zh-CN', {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

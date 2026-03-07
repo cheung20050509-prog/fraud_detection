@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     whisper_model_size: str = "base"    # tiny/base/small/medium/large
     use_cuda: bool = True               # GPU加速
     max_concurrent_inferences: int = 10 # 并发推理限制
+    strict_no_fallback: bool = True     # 拒绝降级：依赖缺失时直接报错
     
     # 风险检测配置 - 软著申请：诈骗风险评估算法
     risk_threshold_low: float = 30.0    # 低风险阈值

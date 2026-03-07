@@ -106,7 +106,7 @@
         <div v-if="transcriptionHistory.length === 0"
              class="text-center py-8 text-gray-500">
           <Mic class="h-8 w-8 mx-auto mb-2 opacity-50" />
-          <p class="text-sm">等待音频输入...</p>
+          <p class="text-sm">{{ transcriptEmptyMessage }}</p>
         </div>
       </div>
 
@@ -223,6 +223,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import AudioRecorder from '@/utils/Recorder'
+import { WebSocketManager, WebSocketStatus } from '@/utils/WebSocketManager'
 import {
   Shield,
   Mic,
@@ -247,14 +248,41 @@ const transcriptionHistory = ref<Array<{
   timestamp: Date
   riskScore: number
 }>>([])
+const wsStatus = ref<WebSocketStatus>(WebSocketStatus.CLOSED)
+const sessionId = ref<string>('')
+const analysisFrameCount = ref(0)
+const emptyTranscriptCount = ref(0)
+const MONITOR_SEGMENT_MS = 2500
 
 // 音频录制器
 let recorder: AudioRecorder | null = null
 let monitoringInterval: number | null = null
+let wsManager: WebSocketManager | null = null
+let segmentInterval: number | null = null
+let segmentFlushInProgress = false
+
+const forceStopMonitoring = () => {
+  if (isMonitoring.value) {
+    try {
+      recorder?.stop()
+    } catch (error) {
+      console.error('停止录制失败:', error)
+    }
+  }
+
+  stopMonitoringTimer()
+  stopSegmentCapture()
+  isMonitoring.value = false
+  isProcessing.value = false
+}
 
 // 计算属性
 const statusText = computed(() => {
-  if (isMonitoring.value) return '监听中'
+  if (isMonitoring.value) {
+    if (wsStatus.value === WebSocketStatus.OPEN) return '监听中'
+    if (wsStatus.value === WebSocketStatus.RECONNECTING) return '重连中'
+    return '连接中'
+  }
   if (isProcessing.value) return '处理中'
   return '待机'
 })
@@ -358,14 +386,155 @@ const alertWarnings = computed(() => {
   return warnings
 })
 
+const transcriptEmptyMessage = computed(() => {
+  if (transcriptionHistory.value.length > 0) return ''
+  if (!isMonitoring.value) return '等待音频输入...'
+  if (analysisFrameCount.value > 0 || emptyTranscriptCount.value > 0) {
+    return '已收到音频，但暂未识别出清晰语音，请连续说 2 到 3 秒并靠近麦克风'
+  }
+  if (recordingDuration.value >= 3) {
+    return '正在接收音频并等待首条转录结果...'
+  }
+  return '等待音频输入...'
+})
+
+const buildWsUrl = (monitoringSessionId: string) => {
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const host = window.location.host
+  const query = new URLSearchParams({
+    session_id: monitoringSessionId,
+  })
+  return `${protocol}://${host}/ws/audio/monitoring?${query.toString()}`
+}
+
+const createMonitoringSession = async () => {
+  const response = await fetch('/api/monitoring/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sensitivity_level: 'medium',
+      alert_types: ['voice_biometrics', 'behavioral', 'content'],
+      auto_record: true,
+    }),
+  })
+
+  if (!response.ok) {
+    const errorDetail = await response.text()
+    throw new Error(errorDetail || '创建监护会话失败')
+  }
+
+  const result = await response.json()
+  const monitoringSessionId = typeof result?.session_id === 'string' ? result.session_id : ''
+  if (!monitoringSessionId) {
+    throw new Error('监护会话响应缺少 session_id')
+  }
+
+  sessionId.value = monitoringSessionId
+  return monitoringSessionId
+}
+
+const initWebSocket = async () => {
+  if (wsManager) return
+
+  const monitoringSessionId = sessionId.value || await createMonitoringSession()
+
+  wsManager = new WebSocketManager({
+    url: buildWsUrl(monitoringSessionId),
+    reconnectInterval: 2500,
+    maxReconnectAttempts: 8,
+    heartbeatInterval: 0,
+    onStatusChange: (status) => {
+      wsStatus.value = status
+    },
+    onClose: () => {
+      if (isMonitoring.value) {
+        forceStopMonitoring()
+      }
+    },
+    onMessage: (event) => {
+      try {
+        const payload = JSON.parse(event.data)
+        handleWsMessage(payload)
+      } catch (error) {
+        console.error('解析WebSocket消息失败:', error)
+      }
+    },
+    onError: () => {
+      console.error('监护WebSocket发生错误')
+      if (isMonitoring.value) {
+        forceStopMonitoring()
+      }
+    }
+  })
+
+  await wsManager.connect()
+}
+
+const disconnectWebSocket = () => {
+  wsManager?.disconnect()
+  wsManager = null
+  wsStatus.value = WebSocketStatus.CLOSED
+  sessionId.value = ''
+}
+
+const handleWsMessage = (payload: any) => {
+  const messageType = payload?.type
+
+  if (messageType === 'connection_established') {
+    sessionId.value = payload?.session_id || ''
+    return
+  }
+
+  if (messageType === 'risk_analysis') {
+    const data = payload?.data || {}
+    const score = Number(data?.risk_score || 0)
+    currentRiskScore.value = Math.max(0, Math.min(100, score))
+    analysisFrameCount.value += 1
+
+    const transcript = typeof data?.transcript === 'string' ? data.transcript.trim() : ''
+    if (transcript) {
+      emptyTranscriptCount.value = 0
+
+      transcriptionHistory.value.unshift({
+        text: transcript,
+        timestamp: new Date(),
+        riskScore: currentRiskScore.value,
+      })
+
+      if (transcriptionHistory.value.length > 30) {
+        transcriptionHistory.value = transcriptionHistory.value.slice(0, 30)
+      }
+    } else if (Number(data?.processing_time_ms || 0) > 0) {
+      emptyTranscriptCount.value += 1
+    }
+    return
+  }
+
+  if (messageType === 'fraud_alert') {
+    const score = Number(payload?.data?.risk_score || currentRiskScore.value)
+    currentRiskScore.value = Math.max(currentRiskScore.value, score)
+    showAlert.value = true
+    vibrateDevice()
+    return
+  }
+
+  if (messageType === 'error') {
+    console.error('监护后端错误:', payload?.message || payload)
+    alert(payload?.message || '监护服务异常，请稍后重试')
+    forceStopMonitoring()
+    disconnectWebSocket()
+    return
+  }
+}
+
 // 方法
 const initRecorder = async () => {
   try {
     recorder = new AudioRecorder({
       sampleRate: 16000,
       channels: 1,
+      streaming: false,
       format: 'audio/webm',
-      onAudioData: handleAudioData,
       onError: (error) => {
         console.error('录制错误:', error)
         isProcessing.value = false
@@ -381,45 +550,67 @@ const initRecorder = async () => {
   }
 }
 
-const handleAudioData = (blob: Blob) => {
-  // 这里应该发送到后端进行AI分析
-  // 目前使用模拟数据
-  simulateRiskAnalysis(blob)
+const sendMonitoringAudio = (blob: Blob) => {
+  if (!blob || blob.size === 0 || !wsManager) return
+
+  if (!wsManager.isConnected()) {
+    return
+  }
+
+  wsManager.send(blob)
 }
 
-const simulateRiskAnalysis = (blob: Blob) => {
-  // 模拟风险分析
-  const randomRisk = Math.random() * 100
-  currentRiskScore.value = randomRisk
+const flushCurrentSegment = async () => {
+  if (!recorder || segmentFlushInProgress) return
 
-  // 模拟转录文本
-  const mockTexts = [
-    '您好，这里是公安局，请问您最近有没有接到可疑的电话？',
-    '恭喜您中奖了，请提供银行信息验证',
-    '您的账户异常，请立即处理',
-    '这是一个重要的通知，请配合我们的调查',
-    '时间很紧急，请立即转账到安全账户'
-  ]
+  const recorderState = recorder.getState()
+  if (!recorderState.isRecording) return
 
-  if (Math.random() > 0.7) {
-    const randomText = mockTexts[Math.floor(Math.random() * mockTexts.length)]
-    transcriptionHistory.value.unshift({
-      text: randomText,
-      timestamp: new Date(),
-      riskScore: randomRisk
-    })
-
-    // 限制历史记录数量
-    if (transcriptionHistory.value.length > 10) {
-      transcriptionHistory.value = transcriptionHistory.value.slice(0, 10)
+  segmentFlushInProgress = true
+  try {
+    const audioBlob = await recorder.stop()
+    if (audioBlob && audioBlob.size > 0) {
+      sendMonitoringAudio(audioBlob)
     }
-
-    // 检查是否需要显示警报
-    if (randomRisk > 70) {
-      showAlert.value = true
-      vibrateDevice()
-    }
+  } finally {
+    segmentFlushInProgress = false
   }
+}
+
+const startSegmentCapture = async () => {
+  if (!recorder) return
+
+  stopSegmentCapture()
+  await recorder.start()
+
+  segmentInterval = window.setInterval(async () => {
+    if (!isMonitoring.value || !recorder || segmentFlushInProgress) {
+      return
+    }
+
+    await flushCurrentSegment()
+
+    if (isMonitoring.value && recorder && !recorder.getState().isRecording) {
+      try {
+        await recorder.start()
+      } catch (error) {
+        console.error('重启监护录制失败:', error)
+        forceStopMonitoring()
+      }
+    }
+  }, MONITOR_SEGMENT_MS)
+}
+
+const stopSegmentCapture = () => {
+  if (segmentInterval) {
+    clearInterval(segmentInterval)
+    segmentInterval = null
+  }
+}
+
+const finalizeSegmentCapture = async () => {
+  stopSegmentCapture()
+  await flushCurrentSegment()
 }
 
 const toggleMonitoring = async () => {
@@ -432,15 +623,20 @@ const toggleMonitoring = async () => {
 
     if (isMonitoring.value) {
       // 停止监护
-      recorder?.stop()
       stopMonitoringTimer()
+      await finalizeSegmentCapture()
+      disconnectWebSocket()
       isMonitoring.value = false
       currentRiskScore.value = 0
     } else {
       // 开始监护
-      await recorder?.start()
-      startMonitoringTimer()
+      showAlert.value = false
+      analysisFrameCount.value = 0
+      emptyTranscriptCount.value = 0
+      await initWebSocket()
       isMonitoring.value = true
+      await startSegmentCapture()
+      startMonitoringTimer()
     }
   } catch (error) {
     console.error('切换监护状态失败:', error)
@@ -467,6 +663,8 @@ const stopMonitoringTimer = () => {
 const clearHistory = () => {
   transcriptionHistory.value = []
   currentRiskScore.value = 0
+  analysisFrameCount.value = 0
+  emptyTranscriptCount.value = 0
 }
 
 const dismissAlert = () => {
@@ -526,8 +724,10 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  stopSegmentCapture()
   recorder?.cleanup()
   stopMonitoringTimer()
+  disconnectWebSocket()
 })
 </script>
 

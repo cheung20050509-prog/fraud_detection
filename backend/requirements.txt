@@ -12,12 +12,15 @@ aiortc==1.6.0
 # AI模型相关
 torch==2.1.0
 torchaudio==2.1.0
-transformers==4.35.2
+# Qwen2Audio依赖较新的Transformers栈（含qwen2_5_omni）
+transformers==4.52.4
+tokenizers==0.21.4
+huggingface-hub==0.36.2
 # Qwen2Audio（可选，官方模型需要手动安装）
 # pip install git+https://github.com/QwenLM/Qwen2Audio.git
 openai-whisper==20231117
 funasr==1.0.25
-edge-tts==6.1.10
+edge-tts==7.2.7
 # 降级方案：使用Mock模型（如无法获取Qwen2Audio官方源码）
 # pip install mock-alibaba-qwen2audio
 

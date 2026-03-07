@@ -4,16 +4,50 @@ WebSocket连接管理器 - 软著申请：实时通信核心组件
 """
 
 from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from typing import Dict, List, Optional, Any
 import json
 import asyncio
 import uuid
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, is_dataclass
 import logging
 from collections import defaultdict
 
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
+
 logger = logging.getLogger(__name__)
+
+
+def _to_json_safe(value: Any) -> Any:
+    """将消息体转换为可被 json.dumps 序列化的基础类型。"""
+
+    if is_dataclass(value):
+        return _to_json_safe(asdict(value))
+
+    if isinstance(value, dict):
+        return {str(key): _to_json_safe(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(item) for item in value]
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+
+    item_getter = getattr(value, "item", None)
+    if callable(item_getter):
+        try:
+            return _to_json_safe(item_getter())
+        except Exception:
+            pass
+
+    return value
 
 @dataclass
 class ConnectionInfo:
@@ -70,14 +104,23 @@ class ConnectionManager:
         
         logger.info("WebSocket 后台清理和广播任务已启动")
     
-    async def connect(self, websocket: WebSocket, mode: str = "unknown", user_id: str = None) -> str:
+    async def connect(
+        self,
+        websocket: WebSocket,
+        mode: str = "unknown",
+        user_id: str = None,
+        session_id: str | None = None,
+    ) -> str:
         """建立新连接 - 软著申请：WebSocket连接建立和认证"""
         
         try:
             await websocket.accept()
             
             # 生成唯一会话ID
-            session_id = str(uuid.uuid4())
+            session_id = session_id or str(uuid.uuid4())
+
+            if session_id in self.active_connections:
+                raise RuntimeError(f"连接已存在: {session_id}")
             
             # 创建连接信息
             connection_info = ConnectionInfo(
@@ -125,7 +168,8 @@ class ConnectionManager:
         
         try:
             # 关闭WebSocket连接
-            await connection_info.websocket.close()
+            if connection_info.websocket.application_state != WebSocketState.DISCONNECTED:
+                await connection_info.websocket.close()
         except Exception as e:
             logger.warning(f"关闭WebSocket连接时出错: {e}")
         
@@ -146,24 +190,32 @@ class ConnectionManager:
         self._update_stats()
         
         logger.info(f"连接断开: {session_id}")
+
+    def has_connection(self, session_id: str) -> bool:
+        """检查连接是否仍然活跃。"""
+
+        return session_id in self.active_connections
     
-    async def send_message(self, session_id: str, message: Dict[str, Any]):
+    async def send_message(self, session_id: str, message: Dict[str, Any]) -> bool:
         """发送消息到指定连接 - 软著申请：点对点消息传输"""
         
         connection_info = self.active_connections.get(session_id)
         if not connection_info:
             logger.warning(f"连接不存在: {session_id}")
-            return
+            return False
         
         try:
-            await connection_info.websocket.send_text(json.dumps(message, ensure_ascii=False))
+            payload = _to_json_safe(message)
+            await connection_info.websocket.send_text(json.dumps(payload, ensure_ascii=False))
             
             # 更新最后活动时间
             connection_info.last_activity = datetime.utcnow()
+            return True
             
         except Exception as e:
             logger.error(f"发送消息失败 {session_id}: {e}")
             await self.disconnect(session_id)
+            return False
     
     async def send_binary(self, session_id: str, data: bytes):
         """发送二进制数据到指定连接 - 软著申请：音频流二进制传输"""
@@ -293,6 +345,7 @@ class ConnectionManager:
         
         self.connection_stats.update({
             "total_connections": len(self.active_connections),
+            "active_connections": len(self.active_connections),
             "practice_sessions": len(self.mode_connections.get("practice", [])),
             "monitoring_sessions": len(self.mode_connections.get("monitoring", [])),
             "analysis_sessions": len(self.mode_connections.get("analysis", []))

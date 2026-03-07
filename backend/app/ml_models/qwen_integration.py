@@ -4,6 +4,7 @@ Qwen2Audio集成模块 - 软著申请：Qwen2Audio模型接口
 """
 
 import asyncio
+import importlib
 import json
 import logging
 import re
@@ -12,10 +13,16 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
-import torch
 
 try:
-    from transformers import AutoModelForCausalLM, AutoProcessor
+    torch = importlib.import_module("torch")
+except Exception:  # pragma: no cover
+    torch = None
+
+try:
+    transformers_module = importlib.import_module("transformers")
+    AutoModelForCausalLM = getattr(transformers_module, "AutoModelForCausalLM")
+    AutoProcessor = getattr(transformers_module, "AutoProcessor")
 except Exception:  # pragma: no cover
     AutoModelForCausalLM = None
     AutoProcessor = None
@@ -23,6 +30,12 @@ except Exception:  # pragma: no cover
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _strict_no_fallback() -> bool:
+    """返回当前是否启用严格模式。"""
+
+    return bool(getattr(settings, "strict_no_fallback", True))
 
 
 def _schedule_background_task(coro) -> bool:
@@ -33,6 +46,10 @@ def _schedule_background_task(coro) -> bool:
         loop.create_task(coro)
         return True
     except RuntimeError:
+        try:
+            coro.close()
+        except Exception:
+            pass
         return False
 
 
@@ -45,21 +62,22 @@ class QwenAudioProcessor:
         self.model_path = model_path or settings.qwen_model_path
         self.model = None
         self.processor = None
-        self.device = "cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
+        self.device = "cpu"
+        if settings.use_cuda and torch is not None and torch.cuda.is_available():
+            self.device = "cuda"
 
         # 模型配置
         self.max_audio_length = 30.0  # 最大音频长度（秒）
         self.sample_rate = settings.audio_sample_rate
 
-        self.model_backend = "mock"
+        self.model_backend = "uninitialized"
         self._init_error: Optional[str] = None
+        self._init_attempts = 0
+        self._max_init_attempts = 2
 
-        # 异步初始化
+        # 使用懒加载，避免与Whisper并发初始化触发meta张量竞争。
         self._initialized = False
         self._init_lock = asyncio.Lock()
-        self._init_started = _schedule_background_task(self._async_init())
-        if not self._init_started:
-            logger.info("Qwen2Audio处理器将在首次推理时懒加载")
 
     def _resolve_model_dir(self) -> Path:
         """解析模型目录，兼容工作目录差异。"""
@@ -79,12 +97,22 @@ class QwenAudioProcessor:
         """异步初始化模型"""
 
         async with self._init_lock:
-            if self._initialized:
+            if self._initialized and self.model is not None and self.processor is not None:
                 return
+
+            if self.model is None and self._init_attempts >= self._max_init_attempts:
+                return
+
+            self._init_attempts += 1
 
             try:
                 model_dir = self._resolve_model_dir()
-                logger.info("正在加载Qwen2Audio模型: %s", model_dir)
+                logger.info(
+                    "正在加载Qwen2Audio模型: %s (attempt %s/%s)",
+                    model_dir,
+                    self._init_attempts,
+                    self._max_init_attempts,
+                )
 
                 if AutoProcessor is None or AutoModelForCausalLM is None:
                     raise ImportError("transformers未正确安装，无法加载真实模型")
@@ -100,12 +128,19 @@ class QwenAudioProcessor:
                 logger.info("Qwen2Audio真实模型加载完成")
 
             except Exception as e:
-                logger.error("Qwen2Audio真实模型加载失败，回退到Mock: %s", e)
-                self.model = MockQwenModel()
-                self.processor = MockQwenProcessor()
-                self.model_backend = "mock"
+                self.model = None
+                self.processor = None
+                self.model_backend = "unavailable"
                 self._init_error = str(e)
                 self._initialized = True
+
+                if _strict_no_fallback():
+                    logger.error("Qwen2Audio真实模型加载失败（严格模式，不允许降级）: %s", e)
+                else:
+                    logger.error("Qwen2Audio真实模型加载失败，回退到Mock: %s", e)
+                    self.model = MockQwenModel()
+                    self.processor = MockQwenProcessor()
+                    self.model_backend = "mock"
 
     def _load_real_model_sync(self, model_dir: Path):
         """同步加载真实模型，在线程池中执行。"""
@@ -155,10 +190,18 @@ class QwenAudioProcessor:
         """
 
         try:
-            if not self._initialized:
+            should_retry_init = (
+                (self.model is None or self.processor is None)
+                and self._init_attempts < self._max_init_attempts
+            )
+            if not self._initialized or should_retry_init:
                 await self._async_init()
-                if not self._initialized:
-                    return self._get_mock_result()
+
+            if self.model is None or self.processor is None:
+                message = self._init_error or "模型未初始化"
+                if _strict_no_fallback():
+                    raise RuntimeError(f"Qwen2Audio不可用: {message}")
+                return self._get_mock_result()
 
             # 检查音频长度
             duration = len(audio_array) / self.sample_rate
@@ -182,16 +225,20 @@ class QwenAudioProcessor:
 
         except Exception as e:
             logger.error("Qwen2Audio分析失败: %s", e)
+            if _strict_no_fallback():
+                raise
             return self._get_mock_result()
 
     def _predict_real_sync(self, audio_array: np.ndarray) -> Dict[str, Any]:
         """真实模型同步推理。"""
 
         if self.model is None or self.processor is None:
-            return self._get_mock_result()
+            raise RuntimeError("Qwen2Audio模型或处理器未就绪")
 
         wave = np.asarray(audio_array, dtype=np.float32).reshape(-1)
         if wave.size == 0:
+            if _strict_no_fallback():
+                raise ValueError("输入音频为空")
             return self._get_mock_result()
 
         # 归一化输入振幅，防止异常峰值影响推理。
@@ -213,10 +260,15 @@ class QwenAudioProcessor:
             return_tensors="pt",
         )
 
-        target_device = next(self.model.parameters()).device
+        target_param = next(self.model.parameters())
+        target_device = target_param.device
+        target_dtype = target_param.dtype
         for key, value in list(inputs.items()):
             if isinstance(value, torch.Tensor):
-                inputs[key] = value.to(target_device)
+                if value.is_floating_point():
+                    inputs[key] = value.to(device=target_device, dtype=target_dtype)
+                else:
+                    inputs[key] = value.to(device=target_device)
 
         generate_kwargs: Dict[str, Any] = {
             "max_new_tokens": 160,
@@ -431,6 +483,8 @@ class QwenAudioProcessor:
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     logger.error("批量分析第%s项失败: %s", i + 1, result)
+                    if _strict_no_fallback():
+                        raise RuntimeError(f"批量分析第{i + 1}项失败: {result}") from result
                     processed_results.append(self._get_mock_result())
                 else:
                     processed_results.append(result)
@@ -439,6 +493,8 @@ class QwenAudioProcessor:
 
         except Exception as e:
             logger.error("批量分析失败: %s", e)
+            if _strict_no_fallback():
+                raise
             return [self._get_mock_result()] * len(audio_list)
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -451,6 +507,8 @@ class QwenAudioProcessor:
             "backend": self.model_backend,
             "initialized": self._initialized,
             "init_error": self._init_error,
+            "init_attempts": self._init_attempts,
+            "max_init_attempts": self._max_init_attempts,
             "max_audio_length": self.max_audio_length,
             "sample_rate": self.sample_rate,
             "timestamp": datetime.utcnow().isoformat(),
@@ -508,11 +566,7 @@ class QwenModelManager:
     def __init__(self):
         self.processors = {}  # {processor_id: QwenAudioProcessor}
         self.default_processor = None
-
-        # 异步初始化默认处理器
-        scheduled = _schedule_background_task(self._init_default_processor())
-        if not scheduled:
-            logger.info("QwenModelManager将在首次访问时创建默认处理器")
+        logger.info("QwenModelManager采用懒加载策略")
 
     async def _init_default_processor(self):
         """初始化默认处理器"""

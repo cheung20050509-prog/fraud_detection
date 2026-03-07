@@ -10,6 +10,7 @@ from datetime import datetime
 
 from app.database.database import get_db
 from app.database.models import MonitoringSession, FraudAlert, User
+from app.services.monitoring_session_service import monitoring_session_service
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -17,7 +18,7 @@ router = APIRouter()
 # Pydantic模型
 class MonitoringSessionCreate(BaseModel):
     """创建监听会话请求模型"""
-    user_id: int
+    user_id: int | None = None
     sensitivity_level: str = "medium"
     alert_types: List[str] = ["voice_biometrics", "behavioral", "content"]
     auto_record: bool = True
@@ -38,36 +39,24 @@ async def create_monitoring_session(
     """创建新的监听会话"""
     
     try:
-        # 验证用户存在
-        user = db.query(User).filter(User.user_id == session_data.user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="用户不存在")
-        
-        # 创建会话
-        monitoring_session = MonitoringSession(
+        session_payload = monitoring_session_service.create_session(
             user_id=session_data.user_id,
-            status='active',
-            session_data={
-                "sensitivity_level": session_data.sensitivity_level,
-                "alert_types": session_data.alert_types,
-                "auto_record": session_data.auto_record
-            }
+            sensitivity_level=session_data.sensitivity_level,
+            alert_types=session_data.alert_types,
+            auto_record=session_data.auto_record,
         )
-        
-        db.add(monitoring_session)
-        db.commit()
-        db.refresh(monitoring_session)
-        
+
         return MonitoringSessionResponse(
-            session_id=monitoring_session.session_id,
-            status=monitoring_session.status,
-            created_at=monitoring_session.start_time,
+            session_id=session_payload["session_id"],
+            status=session_payload["status"],
+            created_at=session_payload["created_at"],
             sensitivity_level=session_data.sensitivity_level,
             auto_record=session_data.auto_record
         )
         
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        db.rollback()
         raise HTTPException(status_code=500, detail=f"创建监听会话失败: {e}")
 
 @router.get("/session/{session_id}/risk")

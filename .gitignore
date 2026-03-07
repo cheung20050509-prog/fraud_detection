@@ -30,6 +30,7 @@ frontend/dist/
 
 # Runtime data
 backend/logs/
+frontend/.logs/
 backend/uploads/
 backend/*.db
 backend/fraud_detection.db

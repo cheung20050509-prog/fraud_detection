@@ -4,15 +4,41 @@ Whisper集成模块 - 软著申请：Whisper ASR模型接口
 """
 
 import asyncio
+import importlib
 import logging
 import numpy as np
 from typing import Dict, Any, Optional, List
-import torch
 from datetime import datetime
+
+try:
+    torch = importlib.import_module("torch")
+except Exception:  # pragma: no cover
+    torch = None
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _strict_no_fallback() -> bool:
+    """返回当前是否启用严格模式。"""
+
+    return bool(getattr(settings, "strict_no_fallback", True))
+
+
+def _schedule_background_task(coro) -> bool:
+    """在可用事件循环中调度后台协程。"""
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+        return True
+    except RuntimeError:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return False
 
 class WhisperProcessor:
     """Whisper处理器 - 软著申请：语音识别核心引擎"""
@@ -24,6 +50,11 @@ class WhisperProcessor:
         self.device = device
         self.model = None
         self.sample_rate = 16000  # Whisper固定采样率
+        self.model_backend = "uninitialized"
+        self._init_error: Optional[str] = None
+        self._init_lock = asyncio.Lock()
+        self._init_attempts = 0
+        self._max_init_attempts = 2
         
         # 支持的语言
         self.supported_languages = {
@@ -39,26 +70,52 @@ class WhisperProcessor:
             "ru": "russian"
         }
         
-        # 异步初始化
+        # 使用懒加载，避免与其他大模型并发初始化触发meta张量竞争。
         self._initialized = False
-        asyncio.create_task(self._async_init())
     
     async def _async_init(self):
         """异步初始化模型"""
-        try:
-            logger.info(f"正在加载Whisper模型 (size: {self.model_size})...")
-            
-            # 这里应该实现实际的模型加载逻辑
-            # 目前使用Mock实现
-            self.model = MockWhisperModel(self.model_size, self.device)
-            self._initialized = True
-            
-            logger.info(f"Whisper模型加载完成: {self.model_size}")
-            
-        except Exception as e:
-            logger.error(f"Whisper模型加载失败: {e}")
-            self.model = MockWhisperModel(self.model_size, self.device)
-            self._initialized = True
+        async with self._init_lock:
+            if self._initialized and self.model is not None:
+                return
+
+            if self.model is None and self._init_attempts >= self._max_init_attempts:
+                return
+
+            self._init_attempts += 1
+
+            try:
+                logger.info(
+                    "正在加载Whisper模型 (size: %s, attempt: %s/%s)...",
+                    self.model_size,
+                    self._init_attempts,
+                    self._max_init_attempts,
+                )
+
+                # 优先加载真实Whisper模型
+                import whisper
+
+                self.model = await asyncio.to_thread(
+                    whisper.load_model,
+                    self.model_size,
+                    self.device,
+                )
+                self.model_backend = "real"
+                self._init_error = None
+                self._initialized = True
+
+                logger.info(f"Whisper模型加载完成: {self.model_size}")
+
+            except Exception as e:
+                logger.error(f"Whisper模型加载失败: {e}")
+                self._init_error = str(e)
+                if _strict_no_fallback():
+                    self.model = None
+                    self.model_backend = "unavailable"
+                else:
+                    self.model = MockWhisperModel(self.model_size, self.device)
+                    self.model_backend = "mock"
+                self._initialized = True
     
     async def transcribe(self, audio_array: np.ndarray, 
                          language: str = None, 
@@ -76,14 +133,27 @@ class WhisperProcessor:
         """
         
         try:
-            if not self._initialized:
-                logger.warning("Whisper模型尚未初始化完成，等待...")
-                await asyncio.sleep(0.5)
+            should_retry_init = self.model is None and self._init_attempts < self._max_init_attempts
+            if not self._initialized or should_retry_init:
+                await self._async_init()
                 if not self._initialized:
+                    if _strict_no_fallback():
+                        raise RuntimeError("Whisper初始化未完成")
                     return None
+
+            if self.model is None:
+                message = self._init_error or "模型未初始化"
+                if _strict_no_fallback():
+                    raise RuntimeError(f"Whisper不可用: {message}")
+                return None
+
+            if _strict_no_fallback() and self.model_backend != "real":
+                raise RuntimeError(f"Whisper后端异常: {self.model_backend}")
             
             # 检查音频数据
             if audio_array is None or len(audio_array) == 0:
+                if _strict_no_fallback():
+                    raise ValueError("音频数据为空")
                 logger.warning("音频数据为空")
                 return None
             
@@ -92,15 +162,31 @@ class WhisperProcessor:
                 audio_array = np.mean(audio_array, axis=1)
             
             # 调用模型推理
-            if hasattr(self.model, 'transcribe'):
+            if self.model_backend == "real":
+                kwargs: Dict[str, Any] = {
+                    "audio": np.asarray(audio_array, dtype=np.float32),
+                    "task": task,
+                }
+                if language:
+                    kwargs["language"] = language
+                if self.device == "cuda":
+                    kwargs["fp16"] = True
+
+                result = await asyncio.to_thread(self.model.transcribe, **kwargs)
+                return str(result.get("text", "")).strip()
+            elif hasattr(self.model, "transcribe"):
                 result = await self.model.transcribe(audio_array, language, task)
                 return result.get("text", "").strip()
             else:
+                if _strict_no_fallback():
+                    raise RuntimeError("Whisper模型不支持transcribe")
                 # Mock推理
                 return await self._transcribe_mock(audio_array, language)
             
         except Exception as e:
             logger.error(f"Whisper转录失败: {e}")
+            if _strict_no_fallback():
+                raise
             return None
     
     async def _transcribe_mock(self, audio_array: np.ndarray, 
@@ -195,6 +281,8 @@ class WhisperProcessor:
             
         except Exception as e:
             logger.error(f"带时间戳转录失败: {e}")
+            if _strict_no_fallback():
+                raise RuntimeError(f"带时间戳转录失败: {e}") from e
             return {
                 "text": "",
                 "language": language or "zh",
@@ -217,8 +305,17 @@ class WhisperProcessor:
         """
         
         try:
+            should_retry_init = self.model is None and self._init_attempts < self._max_init_attempts
+            if not self._initialized or should_retry_init:
+                await self._async_init()
+
             if not self._initialized:
+                if _strict_no_fallback():
+                    raise RuntimeError("Whisper未初始化，无法检测语言")
                 return "zh"
+
+            if _strict_no_fallback() and self.model_backend != "real":
+                raise RuntimeError(f"Whisper后端异常: {self.model_backend}")
             
             # 基于音频特征的简单语言检测
             # 实际应用中应该使用Whisper的语言检测功能
@@ -234,6 +331,8 @@ class WhisperProcessor:
             
         except Exception as e:
             logger.error(f"语言检测失败: {e}")
+            if _strict_no_fallback():
+                raise
             return "zh"
     
     async def batch_transcribe(self, audio_list: List[np.ndarray],
@@ -266,6 +365,8 @@ class WhisperProcessor:
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     logger.error(f"批量转录第{i+1}项失败: {result}")
+                    if _strict_no_fallback():
+                        raise RuntimeError(f"批量转录第{i+1}项失败: {result}") from result
                     processed_results.append(None)
                 else:
                     processed_results.append(result)
@@ -274,6 +375,8 @@ class WhisperProcessor:
             
         except Exception as e:
             logger.error(f"批量转录失败: {e}")
+            if _strict_no_fallback():
+                raise RuntimeError(f"批量转录失败: {e}") from e
             return [None] * len(audio_list)
     
     def get_model_info(self) -> Dict[str, Any]:
@@ -284,7 +387,11 @@ class WhisperProcessor:
             "model_size": self.model_size,
             "device": self.device,
             "sample_rate": self.sample_rate,
+            "backend": self.model_backend,
             "initialized": self._initialized,
+            "init_error": self._init_error,
+            "init_attempts": self._init_attempts,
+            "max_init_attempts": self._max_init_attempts,
             "supported_languages": list(self.supported_languages.keys()),
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -356,16 +463,14 @@ class WhisperModelManager:
     def __init__(self):
         self.processors = {}  # {processor_id: WhisperProcessor}
         self.default_processor = None
-        
-        # 异步初始化默认处理器
-        asyncio.create_task(self._init_default_processor())
+        logger.info("WhisperModelManager采用懒加载策略")
     
     async def _init_default_processor(self):
         """初始化默认处理器"""
         try:
             self.default_processor = WhisperProcessor(
                 model_size=settings.whisper_model_size,
-                device="cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
+                device="cuda" if settings.use_cuda and torch is not None and torch.cuda.is_available() else "cpu"
             )
             self.processors["default"] = self.default_processor
             logger.info("默认Whisper处理器初始化完成")
@@ -392,8 +497,22 @@ class WhisperModelManager:
     
     def get_processor(self, processor_id: str = "default") -> WhisperProcessor:
         """获取处理器实例"""
-        
-        return self.processors.get(processor_id, self.default_processor)
+
+        if processor_id in self.processors:
+            return self.processors[processor_id]
+
+        if self.default_processor is None:
+            device = "cpu"
+            if settings.use_cuda and torch is not None and torch.cuda.is_available():
+                device = "cuda"
+
+            self.default_processor = WhisperProcessor(
+                model_size=settings.whisper_model_size,
+                device=device,
+            )
+            self.processors["default"] = self.default_processor
+
+        return self.default_processor
     
     def list_processors(self) -> Dict[str, Dict[str, Any]]:
         """列出所有处理器"""
