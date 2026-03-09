@@ -248,11 +248,22 @@ const transcriptionHistory = ref<Array<{
   timestamp: Date
   riskScore: number
 }>>([])
+const detectedIndicators = ref<string[]>([])
 const wsStatus = ref<WebSocketStatus>(WebSocketStatus.CLOSED)
 const sessionId = ref<string>('')
 const analysisFrameCount = ref(0)
 const emptyTranscriptCount = ref(0)
 const MONITOR_SEGMENT_MS = 2500
+const TRANSCRIPT_MERGE_GAP_MS = 6000
+const TRANSCRIPT_BLOCK_MAX_LENGTH = 180
+const FRAUD_CATEGORY_LABELS: Record<string, string> = {
+  urgency: '紧迫施压',
+  authority: '权威身份',
+  money: '转账汇款',
+  threat: '威胁恐吓',
+  bait: '利益诱导',
+  impersonation: '身份冒充',
+}
 
 // 音频录制器
 let recorder: AudioRecorder | null = null
@@ -371,6 +382,10 @@ const riskIndicators = computed(() => [
 ])
 
 const detectedFeatures = computed(() => {
+  if (detectedIndicators.value.length > 0) {
+    return detectedIndicators.value
+  }
+
   const features = []
   if (currentRiskScore.value > 30) features.push('使用紧急性词汇')
   if (currentRiskScore.value > 50) features.push('官方身份冒充')
@@ -477,6 +492,77 @@ const disconnectWebSocket = () => {
   sessionId.value = ''
 }
 
+const normalizeTranscriptText = (text: string) => text.replace(/\s+/g, ' ').trim()
+
+const mergeTranscriptText = (baseText: string, nextText: string) => {
+  const normalizedBase = normalizeTranscriptText(baseText)
+  const normalizedNext = normalizeTranscriptText(nextText)
+
+  if (!normalizedBase) return normalizedNext
+  if (!normalizedNext) return normalizedBase
+  if (normalizedBase.endsWith(normalizedNext) || normalizedBase.includes(normalizedNext)) {
+    return normalizedBase
+  }
+
+  const maxOverlap = Math.min(normalizedBase.length, normalizedNext.length)
+  for (let overlap = maxOverlap; overlap > 1; overlap -= 1) {
+    if (normalizedBase.slice(-overlap) === normalizedNext.slice(0, overlap)) {
+      return normalizedBase + normalizedNext.slice(overlap)
+    }
+  }
+
+  const needsSpace = /[A-Za-z0-9]$/.test(normalizedBase) && /^[A-Za-z0-9]/.test(normalizedNext)
+  return normalizedBase + (needsSpace ? ' ' : '') + normalizedNext
+}
+
+const formatDetectedIndicator = (indicator: unknown) => {
+  if (typeof indicator !== 'string') return ''
+
+  const [category, keyword] = indicator.split(':', 2)
+  const categoryLabel = FRAUD_CATEGORY_LABELS[category]
+  if (!categoryLabel) return indicator
+  if (!keyword) return categoryLabel
+  return `${categoryLabel}: ${keyword}`
+}
+
+const appendTranscriptHistory = (segmentText: string, riskScore: number) => {
+  const normalizedSegment = normalizeTranscriptText(segmentText)
+  if (!normalizedSegment) return
+
+  const now = new Date()
+  const latestItem = transcriptionHistory.value[0]
+  if (latestItem) {
+    const gapMs = now.getTime() - latestItem.timestamp.getTime()
+    const mergedText = mergeTranscriptText(latestItem.text, normalizedSegment)
+    const canMerge = (
+      gapMs <= TRANSCRIPT_MERGE_GAP_MS
+      && latestItem.text.length < TRANSCRIPT_BLOCK_MAX_LENGTH
+      && mergedText.length <= TRANSCRIPT_BLOCK_MAX_LENGTH
+    )
+
+    if (canMerge) {
+      transcriptionHistory.value = [
+        {
+          text: mergedText,
+          timestamp: now,
+          riskScore: Math.max(latestItem.riskScore, riskScore),
+        },
+        ...transcriptionHistory.value.slice(1),
+      ]
+      return
+    }
+  }
+
+  transcriptionHistory.value = [
+    {
+      text: normalizedSegment,
+      timestamp: now,
+      riskScore,
+    },
+    ...transcriptionHistory.value,
+  ].slice(0, 20)
+}
+
 const handleWsMessage = (payload: any) => {
   const messageType = payload?.type
 
@@ -490,20 +576,17 @@ const handleWsMessage = (payload: any) => {
     const score = Number(data?.risk_score || 0)
     currentRiskScore.value = Math.max(0, Math.min(100, score))
     analysisFrameCount.value += 1
+    detectedIndicators.value = Array.isArray(data?.fraud_indicators)
+      ? data.fraud_indicators
+          .map((indicator: unknown) => formatDetectedIndicator(indicator))
+          .filter((indicator: string) => indicator.length > 0)
+          .slice(0, 6)
+      : []
 
     const transcript = typeof data?.transcript === 'string' ? data.transcript.trim() : ''
     if (transcript) {
       emptyTranscriptCount.value = 0
-
-      transcriptionHistory.value.unshift({
-        text: transcript,
-        timestamp: new Date(),
-        riskScore: currentRiskScore.value,
-      })
-
-      if (transcriptionHistory.value.length > 30) {
-        transcriptionHistory.value = transcriptionHistory.value.slice(0, 30)
-      }
+      appendTranscriptHistory(transcript, currentRiskScore.value)
     } else if (Number(data?.processing_time_ms || 0) > 0) {
       emptyTranscriptCount.value += 1
     }
@@ -662,6 +745,7 @@ const stopMonitoringTimer = () => {
 
 const clearHistory = () => {
   transcriptionHistory.value = []
+  detectedIndicators.value = []
   currentRiskScore.value = 0
   analysisFrameCount.value = 0
   emptyTranscriptCount.value = 0

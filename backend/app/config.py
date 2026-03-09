@@ -56,7 +56,18 @@ class Settings(BaseSettings):
     
     # AI模型配置 - 软著申请：人工智能模型集成
     qwen_model_path: str = "./models/qwen2-audio"
+    asr_backend: str = "funasr"       # funasr/whisper
+    asr_language: str = "auto"        # auto/zh/en/ja/ko/yue
     whisper_model_size: str = "base"    # tiny/base/small/medium/large
+    funasr_model_name: str = "iic/SenseVoiceSmall"
+    funasr_vad_model: Optional[str] = "fsmn-vad"
+    funasr_punc_model: Optional[str] = None
+    funasr_spk_model: Optional[str] = None
+    funasr_batch_size_s: int = 0
+    funasr_merge_vad: bool = True
+    funasr_merge_length_s: int = 15
+    funasr_vad_max_single_segment_ms: int = 30000
+    funasr_use_itn: bool = True
     use_cuda: bool = True               # GPU加速
     max_concurrent_inferences: int = 10 # 并发推理限制
     strict_no_fallback: bool = True     # 拒绝降级：依赖缺失时直接报错

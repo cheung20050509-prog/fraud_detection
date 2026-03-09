@@ -57,6 +57,10 @@ class FraudDetectionService:
         # 风险历史缓存 - 用于平滑风险评分
         self.risk_history = {}
         self.history_window = 30.0  # 历史窗口(秒)
+
+        # 转录历史缓存 - 用于滚动文本窗口和关键词稳态检测
+        self.transcript_history = {}
+        self.transcript_window = 15.0  # 最近15秒转录窗口
         
         # 诈骗关键词库 - 软著申请：诈骗模式识别词典
         self.fraud_keywords = {
@@ -156,11 +160,13 @@ class FraudDetectionService:
 
             asr_result = await self._asr_transcription(analysis_audio, session_id)
             transcript_text = asr_result.get("transcript") if isinstance(asr_result, dict) else ""
+            await self._update_transcript_history(session_id, transcript_text)
+            rolling_transcript = await self._get_rolling_transcript(session_id)
             
             # 并行执行其余分析 - 软著申请：多模态融合分析
             tasks = [
                 self._qwen_analysis(analysis_audio, session_id),
-                self._keyword_detection(analysis_audio, session_id, transcript=transcript_text),
+                self._keyword_detection(analysis_audio, session_id, transcript=rolling_transcript),
                 self._voice_analysis(analysis_audio, session_id)
             ]
 
@@ -297,6 +303,37 @@ class FraudDetectionService:
             if self.strict_no_fallback:
                 raise RuntimeError(f"语音特征提取失败: {e}") from e
             return {"urgency_score": 0.0, "manipulation_score": 0.0, "voice_features": {}}
+
+    def _normalize_percentage_score(self, score: Any) -> float:
+        """将不同量纲的分数统一归一到0-100。"""
+
+        try:
+            numeric_score = float(score)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if numeric_score <= 1.0:
+            numeric_score *= 100.0
+
+        return max(0.0, min(100.0, numeric_score))
+
+    def _normalize_keyword_score(self, keyword_score: Any) -> float:
+        """关键词检测原始分值范围为0-60，这里映射到0-100。"""
+
+        try:
+            raw_keyword_score = float(keyword_score)
+        except (TypeError, ValueError):
+            return 0.0
+
+        raw_keyword_score = max(0.0, min(60.0, raw_keyword_score))
+        return (raw_keyword_score / 60.0) * 100.0
+
+    def _normalize_voice_score(self, urgency_score: Any, manipulation_score: Any) -> float:
+        """语音风险由紧急性和操纵性共同构成，统一映射到0-100。"""
+
+        normalized_urgency = self._normalize_percentage_score(urgency_score)
+        normalized_manipulation = self._normalize_percentage_score(manipulation_score)
+        return (normalized_urgency * 0.5) + (normalized_manipulation * 0.5)
     
     async def _fuse_analysis_results(self, qwen_result: Dict, asr_result: Dict, 
                                     keyword_result: Dict, voice_result: Dict, 
@@ -314,31 +351,41 @@ class FraudDetectionService:
             if invalid_inputs:
                 raise RuntimeError(f"融合输入结果格式非法: {', '.join(invalid_inputs)}")
         
-        # 权重配置 - 软著申请：多算法动态权重分配
-        weights = {
-            "qwen": 0.4,      # Qwen2Audio模型权重最高
-            "keyword": 0.3,   # 关键词检测权重
-            "voice": 0.2,     # 语音特征权重
-            "asr": 0.1        # ASR转录权重
+        # 风险分与置信度分别融合，避免将ASR识别置信度错误算进诈骗风险。
+        risk_weights = {
+            "qwen": 0.45,
+            "keyword": 0.35,
+            "voice": 0.20,
+        }
+        confidence_weights = {
+            "qwen": 0.4,
+            "asr": 0.1,
+            "keyword": 0.25,
+            "voice": 0.25,
         }
         
-        # 计算各项得分
-        qwen_score = qwen_result.get("score", 0.0) * 100
-        keyword_score = keyword_result.get("keyword_score", 0.0)
+        # 计算各项得分，并统一到0-100后再融合。
+        qwen_score = self._normalize_percentage_score(qwen_result.get("score", 0.0))
+        raw_keyword_score = keyword_result.get("keyword_score", 0.0)
+        keyword_score = self._normalize_keyword_score(raw_keyword_score)
         urgency_score = voice_result.get("urgency_score", 0.0)
         manipulation_score = voice_result.get("manipulation_score", 0.0)
-        voice_score = (urgency_score + manipulation_score) * 20
+        normalized_urgency_score = self._normalize_percentage_score(urgency_score)
+        normalized_manipulation_score = self._normalize_percentage_score(manipulation_score)
+        voice_score = self._normalize_voice_score(urgency_score, manipulation_score)
         
         # 加权融合
         final_score = (
-            qwen_score * weights["qwen"] +
-            keyword_score * weights["keyword"] +
-            voice_score * weights["voice"]
+            qwen_score * risk_weights["qwen"] +
+            keyword_score * risk_weights["keyword"] +
+            voice_score * risk_weights["voice"]
         )
         
         # 获取所有诈骗指标
         fraud_indicators = []
+        fraud_indicators.extend([str(item) for item in qwen_result.get("fraud_indicators", []) if item])
         fraud_indicators.extend(keyword_result.get("detected_keywords", []))
+        fraud_indicators = list(dict.fromkeys(fraud_indicators))
         
         # 确定风险等级
         if final_score >= settings.risk_threshold_medium:
@@ -348,9 +395,9 @@ class FraudDetectionService:
         
         # 计算综合置信度
         confidence = (
-            qwen_result.get("confidence", 0.0) * weights["qwen"] +
-            asr_result.get("confidence", 0.0) * weights["asr"] +
-            0.8 * (weights["keyword"] + weights["voice"])  # 规则和特征分析置信度较高
+            qwen_result.get("confidence", 0.0) * confidence_weights["qwen"] +
+            asr_result.get("confidence", 0.0) * confidence_weights["asr"] +
+            0.8 * (confidence_weights["keyword"] + confidence_weights["voice"])
         )
         
         return RiskAnalysis(
@@ -364,8 +411,11 @@ class FraudDetectionService:
                 "qwen_score": qwen_score,
                 "keyword_score": keyword_score,
                 "voice_score": voice_score,
-                "urgency_score": urgency_score,
-                "manipulation_score": manipulation_score,
+                "urgency_score": normalized_urgency_score,
+                "manipulation_score": normalized_manipulation_score,
+                "raw_keyword_score": raw_keyword_score,
+                "raw_urgency_score": urgency_score,
+                "raw_manipulation_score": manipulation_score,
                 "matched_categories": keyword_result.get("matched_categories", [])
             },
             alert_triggered=final_score >= settings.risk_threshold_medium
@@ -373,6 +423,8 @@ class FraudDetectionService:
     
     async def _buffer_audio(self, session_id: str, audio_array: np.ndarray):
         """缓存音频数据"""
+
+        sample_rate = max(1, int(getattr(settings, "audio_sample_rate", 16000)))
         
         if session_id not in self.audio_buffer:
             self.audio_buffer[session_id] = {
@@ -381,7 +433,15 @@ class FraudDetectionService:
             }
         
         buffer = self.audio_buffer[session_id]
-        segment_duration = len(audio_array) / 16000.0  # 16kHz采样率
+        segment_duration = len(audio_array) / float(sample_rate)
+
+        # 如果单个片段已经超过窗口上限，保留最新的窗口长度，而不是整段入队后又被完全清空。
+        if segment_duration >= self.max_buffer_duration:
+            max_samples = int(self.max_buffer_duration * sample_rate)
+            trimmed_audio = np.asarray(audio_array[-max_samples:], dtype=np.float32)
+            buffer["audio_segments"] = deque([trimmed_audio])
+            buffer["total_duration"] = len(trimmed_audio) / float(sample_rate)
+            return
         
         buffer["audio_segments"].append(audio_array)
         buffer["total_duration"] += segment_duration
@@ -389,7 +449,75 @@ class FraudDetectionService:
         # 清理过期数据
         while buffer["total_duration"] > self.max_buffer_duration:
             oldest_segment = buffer["audio_segments"].popleft()
-            buffer["total_duration"] -= len(oldest_segment) / 16000.0
+            buffer["total_duration"] -= len(oldest_segment) / float(sample_rate)
+
+    def _normalize_transcript_text(self, transcript: Optional[str]) -> str:
+        """规范化转录文本，避免空白差异干扰片段合并。"""
+
+        return " ".join(str(transcript or "").split())
+
+    def _merge_transcript_text(self, base_text: str, new_text: str) -> str:
+        """按最大重叠后缀/前缀合并转录片段，减少滚动窗口中的重复文字。"""
+
+        normalized_base = self._normalize_transcript_text(base_text)
+        normalized_new = self._normalize_transcript_text(new_text)
+
+        if not normalized_base:
+            return normalized_new
+        if not normalized_new:
+            return normalized_base
+        if normalized_base.endswith(normalized_new) or normalized_new in normalized_base:
+            return normalized_base
+
+        max_overlap = min(len(normalized_base), len(normalized_new))
+        for overlap in range(max_overlap, 1, -1):
+            if normalized_base[-overlap:] == normalized_new[:overlap]:
+                return normalized_base + normalized_new[overlap:]
+
+        needs_space = (
+            normalized_base[-1].isascii()
+            and normalized_base[-1].isalnum()
+            and normalized_new[0].isascii()
+            and normalized_new[0].isalnum()
+        )
+        separator = " " if needs_space else ""
+        return normalized_base + separator + normalized_new
+
+    async def _update_transcript_history(self, session_id: str, transcript: Optional[str]):
+        """更新最近转录窗口，为关键词检测提供连续上下文。"""
+
+        if session_id not in self.transcript_history:
+            self.transcript_history[session_id] = deque()
+
+        history = self.transcript_history[session_id]
+        now = datetime.now()
+        cutoff_time = now - timedelta(seconds=self.transcript_window)
+
+        normalized_transcript = self._normalize_transcript_text(transcript)
+        if normalized_transcript:
+            history.append({
+                "timestamp": now,
+                "text": normalized_transcript,
+            })
+
+        while history and history[0]["timestamp"] <= cutoff_time:
+            history.popleft()
+
+    async def _get_rolling_transcript(self, session_id: str) -> str:
+        """返回最近窗口内的连续转录文本。"""
+
+        history = self.transcript_history.get(session_id)
+        if not history:
+            return ""
+
+        cutoff_time = datetime.now() - timedelta(seconds=self.transcript_window)
+        while history and history[0]["timestamp"] <= cutoff_time:
+            history.popleft()
+
+        merged_text = ""
+        for entry in history:
+            merged_text = self._merge_transcript_text(merged_text, entry.get("text", ""))
+        return merged_text
     
     async def _should_analyze(self, session_id: str) -> bool:
         """判断是否应该进行分析"""
@@ -466,8 +594,9 @@ class FraudDetectionService:
                 session_data = dict(monitoring_session.session_data or {})
                 session_data["last_analysis_at"] = datetime.utcnow().isoformat()
                 session_data["last_risk_level"] = analysis.risk_level
-                if analysis.transcript:
-                    session_data["last_transcript"] = analysis.transcript[:200]
+                rolling_transcript = await self._get_rolling_transcript(session_id)
+                if rolling_transcript:
+                    session_data["last_transcript"] = rolling_transcript[:200]
                 monitoring_session.session_data = session_data
 
             db.commit()

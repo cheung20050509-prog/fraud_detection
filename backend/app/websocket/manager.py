@@ -159,7 +159,7 @@ class ConnectionManager:
             await websocket.close(code=1011, reason="连接建立失败")
             raise
     
-    async def disconnect(self, session_id: str):
+    async def disconnect(self, session_id: str, close_websocket: bool = True):
         """断开连接 - 软著申请：优雅断开和资源清理"""
         
         connection_info = self.active_connections.get(session_id)
@@ -168,7 +168,11 @@ class ConnectionManager:
         
         try:
             # 关闭WebSocket连接
-            if connection_info.websocket.application_state != WebSocketState.DISCONNECTED:
+            if (
+                close_websocket
+                and connection_info.websocket.application_state == WebSocketState.CONNECTED
+                and connection_info.websocket.client_state == WebSocketState.CONNECTED
+            ):
                 await connection_info.websocket.close()
         except Exception as e:
             logger.warning(f"关闭WebSocket连接时出错: {e}")

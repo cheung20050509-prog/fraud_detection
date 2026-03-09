@@ -192,7 +192,7 @@ async def websocket_audio_endpoint(websocket: WebSocket, mode: str):
         if session_id and mode == "monitoring":
             monitoring_session_service.complete_session(session_id, status=session_status)
         if session_id:
-            await connection_manager.disconnect(session_id)
+            await connection_manager.disconnect(session_id, close_websocket=False)
 
 async def handle_practice_mode(session_id: str, websocket: WebSocket):
     """处理AI陪练模式 - 软著申请：智能对话陪练功能"""
@@ -294,10 +294,10 @@ async def handle_monitoring_mode(session_id: str, websocket: WebSocket) -> str:
                 break
             
             # 如果检测到高风险，触发警报
-            if risk_payload.get("risk_score", 0) > settings.risk_threshold_medium:
+            if risk_payload.get("alert_triggered"):
                 sent = await connection_manager.send_message(session_id, {
                     "type": "fraud_alert",
-                    "severity": "high",
+                    "severity": "high" if risk_payload.get("risk_score", 0) >= 85 else "medium",
                     "message": "检测到潜在的诈骗风险！",
                     "data": risk_payload,
                     "timestamp": datetime.utcnow().isoformat()

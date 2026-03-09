@@ -34,89 +34,114 @@ class ASRService:
     
     def __init__(self):
         """初始化ASR服务"""
-        self.whisper_processor = None
+        self.asr_processor = None
         self.audio_utils = AudioUtils()
         self._init_lock = asyncio.Lock()
         self._init_error: Optional[str] = None
         self.strict_no_fallback = bool(getattr(settings, "strict_no_fallback", True))
         
         # ASR配置
+        self.asr_backend = str(getattr(settings, "asr_backend", "funasr") or "funasr").strip().lower()
+        self.asr_language = str(getattr(settings, "asr_language", "auto") or "auto").strip().lower()
         self.model_size = settings.whisper_model_size
+        self.funasr_model_name = str(getattr(settings, "funasr_model_name", "iic/SenseVoiceSmall"))
         self.sample_rate = settings.audio_sample_rate
         self.use_cuda = settings.use_cuda
         
         # 初始化模型（若当前无事件循环，则在首次调用时懒加载）
         self._init_started = _schedule_background_task(self._init_models())
         if not self._init_started:
-            logger.info("ASRService将在首次转录时初始化Whisper模型")
+            logger.info("ASRService将在首次转录时初始化%s模型", self.asr_backend)
+
+    def _resolve_device(self) -> str:
+        """解析ASR后端使用的设备字符串。"""
+
+        device = "cpu"
+        try:
+            import torch
+
+            if self.use_cuda and torch.cuda.is_available():
+                if self.asr_backend == "funasr":
+                    device = "cuda:0"
+                else:
+                    device = "cuda"
+        except Exception as e:
+            if self.strict_no_fallback:
+                raise RuntimeError(f"torch不可用，严格模式禁止降级: {e}") from e
+            logger.warning("torch不可用，ASR将使用CPU或降级方案")
+        return device
     
     async def _init_models(self):
         """异步初始化ASR模型"""
         async with self._init_lock:
-            if self.whisper_processor is not None:
+            if self.asr_processor is not None:
                 return
 
             try:
-                logger.info(f"正在初始化Whisper模型 (size: {self.model_size})...")
+                device = self._resolve_device()
 
-                device = "cpu"
-                try:
-                    import torch
+                if self.asr_backend == "funasr":
+                    logger.info("正在初始化FunASR模型 (%s)...", self.funasr_model_name)
+                    from app.ml_models.funasr_integration import FunASRProcessor
 
-                    if self.use_cuda and torch.cuda.is_available():
-                        device = "cuda"
-                except Exception as e:
-                    if self.strict_no_fallback:
-                        raise RuntimeError(f"torch不可用，严格模式禁止降级: {e}") from e
-                    logger.warning("torch不可用，ASR将使用CPU或降级方案")
+                    self.asr_processor = FunASRProcessor(
+                        model_name=self.funasr_model_name,
+                        device=device,
+                        vad_model=getattr(settings, "funasr_vad_model", None),
+                        punc_model=getattr(settings, "funasr_punc_model", None),
+                        spk_model=getattr(settings, "funasr_spk_model", None),
+                    )
+                elif self.asr_backend == "whisper":
+                    logger.info("正在初始化Whisper模型 (size: %s)...", self.model_size)
+                    from app.ml_models.whisper_integration import WhisperProcessor
 
-                from app.ml_models.whisper_integration import WhisperProcessor
+                    self.asr_processor = WhisperProcessor(
+                        model_size=self.model_size,
+                        device=device,
+                    )
+                else:
+                    raise RuntimeError(f"不支持的ASR后端: {self.asr_backend}")
 
-                self.whisper_processor = WhisperProcessor(
-                    model_size=self.model_size,
-                    device=device,
-                )
                 self._init_error = None
-                logger.info("Whisper模型初始化完成")
+                logger.info("ASR模型初始化完成: backend=%s", self.asr_backend)
             except Exception as e:
-                logger.error(f"Whisper模型初始化失败: {e}")
+                logger.error("ASR模型初始化失败 (%s): %s", self.asr_backend, e)
                 self._init_error = str(e)
                 if self.strict_no_fallback:
-                    self.whisper_processor = None
+                    self.asr_processor = None
                 else:
-                    # 创建Mock处理器作为降级方案
-                    self.whisper_processor = MockWhisperProcessor()
+                    self.asr_processor = MockASRProcessor()
 
     async def _ensure_initialized(self):
         """确保模型已初始化。"""
 
-        if self.whisper_processor is None:
+        if self.asr_processor is None:
             await self._init_models()
 
-        if self.whisper_processor is None:
-            raise RuntimeError(f"Whisper处理器不可用: {self._init_error or '初始化失败'}")
+        if self.asr_processor is None:
+            raise RuntimeError(f"ASR处理器不可用: {self._init_error or '初始化失败'}")
 
-        backend = getattr(self.whisper_processor, "model_backend", None)
+        backend = getattr(self.asr_processor, "model_backend", None)
         if self.strict_no_fallback and backend == "mock":
-            raise RuntimeError("Whisper当前为Mock后端，严格模式禁止降级")
+            raise RuntimeError("ASR当前为Mock后端，严格模式禁止降级")
 
     async def warmup_model(self):
-        """预热Whisper模型，避免并发初始化导致不稳定状态。"""
+        """预热ASR模型，避免并发初始化导致不稳定状态。"""
 
         await self._ensure_initialized()
 
-        if self.whisper_processor is None:
-            raise RuntimeError("Whisper处理器不可用")
+        if self.asr_processor is None:
+            raise RuntimeError("ASR处理器不可用")
 
-        init_method = getattr(self.whisper_processor, "_async_init", None)
+        init_method = getattr(self.asr_processor, "_async_init", None)
         if callable(init_method):
             await init_method()
 
-        backend = getattr(self.whisper_processor, "model_backend", None)
-        init_error = getattr(self.whisper_processor, "_init_error", None)
+        backend = getattr(self.asr_processor, "model_backend", None)
+        init_error = getattr(self.asr_processor, "_init_error", None)
 
         if self.strict_no_fallback and backend != "real":
-            raise RuntimeError(f"Whisper不可用: {init_error or backend or '模型未就绪'}")
+            raise RuntimeError(f"ASR不可用: {init_error or backend or '模型未就绪'}")
     
     async def transcribe_audio(self, audio_data: Union[bytes, np.ndarray], language: str = "zh") -> Optional[str]:
         """
@@ -141,7 +166,10 @@ class ASRService:
                     return None
 
                 # 音频预处理
-                audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
+                audio_array = await self.audio_utils.preprocess_audio_chunk(
+                    audio_data,
+                    prefer_container_decode=True,
+                )
                 if audio_array is None:
                     logger.warning("音频预处理失败")
                     return None
@@ -156,12 +184,13 @@ class ASRService:
                 logger.warning(f"音频时长过短: {duration:.2f}秒")
                 return None
             
-            # 调用Whisper模型
-            if self.whisper_processor:
-                transcript = await self.whisper_processor.transcribe(audio_array, language)
+            resolved_language = language if language is not None else self.asr_language
+
+            if self.asr_processor:
+                transcript = await self.asr_processor.transcribe(audio_array, resolved_language)
                 return transcript.strip() if transcript else None
             else:
-                logger.error("Whisper处理器未初始化")
+                logger.error("ASR处理器未初始化")
                 return None
             
         except Exception as e:
@@ -190,7 +219,10 @@ class ASRService:
             if isinstance(audio_data, np.ndarray):
                 audio_array = np.asarray(audio_data, dtype=np.float32).reshape(-1)
             else:
-                audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
+                audio_array = await self.audio_utils.preprocess_audio_chunk(
+                    audio_data,
+                    prefer_container_decode=True,
+                )
             duration = len(audio_array) / self.sample_rate if audio_array is not None else 0
             
             return {
@@ -238,10 +270,11 @@ class ASRService:
             all_audio = np.concatenate(audio_chunks)
             
             # 转录合并后的音频
-            if not self.whisper_processor:
+            if not self.asr_processor:
                 return ""
 
-            transcript = await self.whisper_processor.transcribe(all_audio, language)
+            resolved_language = language if language is not None else self.asr_language
+            transcript = await self.asr_processor.transcribe(all_audio, resolved_language)
             return transcript.strip() if transcript else ""
             
         except Exception as e:
@@ -264,17 +297,20 @@ class ASRService:
         try:
             await self._ensure_initialized()
 
-            if not self.whisper_processor:
+            if not self.asr_processor:
                 if self.strict_no_fallback:
-                    raise RuntimeError("Whisper处理器未初始化")
+                    raise RuntimeError("ASR处理器未初始化")
                 return "zh"  # 默认中文
             
-            audio_array = await self.audio_utils.preprocess_audio_chunk(audio_data)
+            audio_array = await self.audio_utils.preprocess_audio_chunk(
+                audio_data,
+                prefer_container_decode=True,
+            )
             if audio_array is None:
                 return "zh"
             
             # 调用语言检测
-            language = await self.whisper_processor.detect_language(audio_array)
+            language = await self.asr_processor.detect_language(audio_array)
             return language if language else "zh"
             
         except Exception as e:
@@ -309,12 +345,14 @@ class ASRService:
             return False
 
 
-class MockWhisperProcessor:
-    """Mock Whisper处理器 - 用于模型加载失败时的降级方案"""
+class MockASRProcessor:
+    """Mock ASR处理器 - 用于模型加载失败时的降级方案"""
     
     def __init__(self, model_size: str = "base", device: str = "cpu"):
         self.model_size = model_size
         self.device = device
+        self.model_backend = "mock"
+        self._init_error = "mock backend"
         
         # Mock转录文本库
         self.mock_transcripts = [
@@ -347,6 +385,9 @@ class MockWhisperProcessor:
         """Mock语言检测"""
         await asyncio.sleep(0.05)
         return "zh"  # 默认返回中文
+
+
+MockWhisperProcessor = MockASRProcessor
 
 
 shared_asr_service = ASRService()

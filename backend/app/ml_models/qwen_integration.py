@@ -10,7 +10,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -228,6 +228,179 @@ class QwenAudioProcessor:
             if _strict_no_fallback():
                 raise
             return self._get_mock_result()
+
+    async def generate_text(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int = 128,
+        temperature: float = 0.8,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.05,
+    ) -> str:
+        """基于当前Qwen模型进行纯文本对话生成。"""
+
+        try:
+            should_retry_init = (
+                (self.model is None or self.processor is None)
+                and self._init_attempts < self._max_init_attempts
+            )
+            if not self._initialized or should_retry_init:
+                await self._async_init()
+
+            if self.model is None or self.processor is None:
+                message = self._init_error or "模型未初始化"
+                if _strict_no_fallback():
+                    raise RuntimeError(f"Qwen2Audio不可用: {message}")
+                return ""
+
+            if self.model_backend != "real":
+                message = self._init_error or f"当前后端为{self.model_backend}"
+                if _strict_no_fallback():
+                    raise RuntimeError(f"Qwen2Audio文本生成不可用: {message}")
+                return ""
+
+            output_text = await asyncio.to_thread(
+                self._generate_text_real_sync,
+                messages,
+                max_new_tokens,
+                temperature,
+                top_p,
+                repetition_penalty,
+            )
+            return self._sanitize_generated_text(output_text)
+
+        except Exception as e:
+            logger.error("Qwen2Audio文本生成失败: %s", e)
+            if _strict_no_fallback():
+                raise
+            return ""
+
+    def _normalize_chat_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """统一聊天消息结构，兼容processor.apply_chat_template。"""
+
+        normalized_messages: List[Dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = message.get("content", "")
+
+            if isinstance(content, str):
+                normalized_content = [{"type": "text", "text": content}]
+            elif isinstance(content, list):
+                normalized_content = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        normalized_content.append({"type": "text", "text": str(item.get("text", ""))})
+                    elif isinstance(item, str):
+                        normalized_content.append({"type": "text", "text": item})
+                if not normalized_content:
+                    normalized_content = [{"type": "text", "text": ""}]
+            else:
+                normalized_content = [{"type": "text", "text": str(content)}]
+
+            normalized_messages.append({
+                "role": role,
+                "content": normalized_content,
+            })
+
+        return normalized_messages
+
+    def _generate_text_real_sync(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+    ) -> str:
+        """同步执行文本对话生成。"""
+
+        if self.model is None or self.processor is None:
+            raise RuntimeError("Qwen2Audio模型或处理器未就绪")
+
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("Qwen2Audio tokenizer不可用")
+
+        normalized_messages = self._normalize_chat_messages(messages)
+        if hasattr(self.processor, "apply_chat_template"):
+            prompt = self.processor.apply_chat_template(
+                normalized_messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        elif hasattr(tokenizer, "apply_chat_template"):
+            prompt = tokenizer.apply_chat_template(
+                normalized_messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        else:
+            prompt_lines = []
+            for message in normalized_messages:
+                text_parts = [item.get("text", "") for item in message.get("content", []) if isinstance(item, dict)]
+                prompt_lines.append(f"{message.get('role', 'user')}: {' '.join(text_parts).strip()}")
+            prompt = "\n".join(prompt_lines) + "\nassistant:"
+
+        inputs = self.processor(
+            text=prompt,
+            audio=None,
+            return_tensors="pt",
+        )
+
+        target_param = next(self.model.parameters())
+        target_device = target_param.device
+        target_dtype = target_param.dtype
+        for key, value in list(inputs.items()):
+            if isinstance(value, torch.Tensor):
+                if value.is_floating_point():
+                    inputs[key] = value.to(device=target_device, dtype=target_dtype)
+                else:
+                    inputs[key] = value.to(device=target_device)
+
+        generate_kwargs: Dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0.0,
+            "temperature": max(0.01, float(temperature)),
+            "top_p": float(top_p),
+            "repetition_penalty": float(repetition_penalty),
+        }
+
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+        if pad_token_id is not None:
+            generate_kwargs["pad_token_id"] = pad_token_id
+
+        if not generate_kwargs["do_sample"]:
+            generate_kwargs.pop("temperature", None)
+            generate_kwargs.pop("top_p", None)
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(**inputs, **generate_kwargs)
+
+        input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
+        generated_ids = output_ids[:, input_len:] if output_ids.shape[1] > input_len else output_ids
+        output_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        return output_text
+
+    def _sanitize_generated_text(self, output_text: str) -> str:
+        """清理模型生成文本，移除多余前缀和包裹引号。"""
+
+        text = str(output_text or "").replace("\r", "").strip()
+        for prefix in (
+            "assistant:",
+            "Assistant:",
+            "回复：",
+            "答：",
+            "下一轮回复：",
+            "下一轮话术：",
+        ):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+
+        if "\n\n" in text:
+            text = text.split("\n\n", 1)[0].strip()
+
+        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        return text.strip(" \t\n\"'“”‘’")
 
     def _predict_real_sync(self, audio_array: np.ndarray) -> Dict[str, Any]:
         """真实模型同步推理。"""
