@@ -83,6 +83,7 @@ main() {
         # Fallback patterns in case ports changed or process is still starting.
         collect_pattern_pids 'uvicorn app.main:app'
         collect_pattern_pids 'node .*vite/bin/vite.js'
+        collect_pattern_pids 'cloudflared tunnel --protocol '
     } | merge_unique_pids)"
 
     if [[ -z "${pids}" ]]; then

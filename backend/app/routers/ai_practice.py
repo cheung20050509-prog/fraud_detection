@@ -100,7 +100,7 @@ async def end_practice_session(session_data: PracticeSessionEndRequest):
     total_messages = int(summary.get("total_messages", 0))
     successful_identifications = int(summary.get("successful_identifications", 0))
     detection_rate = float(summary.get("detection_rate", 0.0))
-    performance_score = round(min(max(detection_rate * 100, 0.0), 100.0), 1)
+    performance_score = float(summary.get("performance_score", 0.0))
 
     return {
         "totalMessages": total_messages,

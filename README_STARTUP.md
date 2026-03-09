@@ -28,10 +28,16 @@ bash start.sh
 
 What this does:
 
+- Starts the FastAPI backend first
 - Starts the FastAPI backend on port `8000`
-- Starts the Vite frontend on port `5173`
+- Starts the Vite frontend next on port `5173`
 - Checks backend health and frontend reachability
-- Prints log file locations
+- Automatically starts a Cloudflare Quick Tunnel last if `cloudflared` is available
+- Prints log file locations and then exits while services continue running via `nohup`
+
+If `cloudflared` exists at `/root/autodl-tmp/cloudflared` or in `PATH`, `start.sh` will automatically create a Quick Tunnel for the frontend and print the public URL.
+
+After startup finishes, the script exits by itself. Backend, frontend, and tunnel processes keep running in the background, so you can disconnect SSH safely.
 
 ## Manual Start
 
@@ -66,14 +72,14 @@ After startup, use these addresses:
 
 ## Stop Services
 
-If you started everything with `bash start.sh`, press `Ctrl+C` in that terminal.
-
 You can also stop services from another shell:
 
 ```bash
 cd /root/autodl-tmp/fraud-blocking-system
 bash stop.sh
 ```
+
+`stop.sh` will also try to stop the Quick Tunnel process started for this project.
 
 ## Remote Access
 
@@ -107,6 +113,8 @@ chmod +x cloudflared
 cd /root/autodl-tmp
 ./cloudflared tunnel --protocol http2 --url http://127.0.0.1:5173
 ```
+
+If you already use `bash start.sh`, you usually do not need to run this command manually because the script can do it automatically.
 
 Why `--protocol http2`:
 

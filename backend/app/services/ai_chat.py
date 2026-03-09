@@ -24,6 +24,30 @@ from app.services.tts_service import TTSService
 
 logger = logging.getLogger(__name__)
 
+DEFENSE_SIGNAL_PATTERNS = {
+    "suspicion": [
+        r"诈骗", r"骗子", r"骗局", r"假的", r"不对劲", r"可疑", r"套路", r"骗人", r"忽悠",
+    ],
+    "verification": [
+        r"核实", r"验证", r"回拨", r"官网", r"官方(?:渠道|电话|客服|号码)?", r"工号", r"警号",
+        r"怎么证明", r"你是谁", r"哪个单位", r"什么部门", r"证件",
+    ],
+    "refusal": [
+        r"不(?:转账|汇款|打款|付款)", r"不(?:会|要|能|肯).{0,4}(?:转账|汇款|打款|付款|操作|点击|下载|配合)",
+        r"不信", r"不需要", r"不参加", r"拒绝",
+    ],
+    "report": [
+        r"报警", r"举报", r"110", r"96110", r"反诈",
+    ],
+    "terminate": [
+        r"挂断", r"挂了", r"别打了", r"不聊了", r"拉黑", r"结束通话", r"再见",
+    ],
+    "protect_info": [
+        r"不(?:会|能|要|肯)?.{0,6}(?:提供|告诉|发送|透露|说出).{0,6}(?:验证码|银行卡|卡号|密码|身份证|短信码|个人信息)",
+        r"(?:验证码|银行卡|卡号|密码|身份证|短信码|个人信息).{0,6}(?:不能|不会|不可能|不提供|不给你|不告诉)",
+    ],
+}
+
 class AIChatService:
     """AI聊天服务类 - 软著申请：对话管理系统"""
     
@@ -49,7 +73,8 @@ class AIChatService:
 
             # 统计用户轮次
             context["user_responses_count"] = context.get("user_responses_count", 0) + 1
-            if any(token in message for token in ["诈骗", "可疑", "挂断", "报警", "核实"]):
+            defense_signal = self._evaluate_user_defense_response(message)
+            if defense_signal["successful"]:
                 context["successful_identifications"] = context.get("successful_identifications", 0) + 1
 
             fraud_analysis = await self._detect_fraud_indicators(message, None)
@@ -62,6 +87,7 @@ class AIChatService:
                 "content": message,
                 "timestamp": datetime.utcnow().isoformat(),
                 "risk_score": fraud_analysis.get("risk_score", 0.0),
+                "defense_categories": defense_signal["categories"],
             })
             
             # 记录AI回复
@@ -129,6 +155,7 @@ class AIChatService:
                 audio_data,
                 audio_array=audio_array,
             )
+            defense_signal = self._evaluate_user_defense_response(transcript)
             
             # 3. 生成AI回复
             ai_response = await self._generate_ai_response(transcript, context, fraud_analysis)
@@ -143,6 +170,7 @@ class AIChatService:
                 "timestamp": datetime.utcnow().isoformat(),
                 "audio_processed": True,
                 "risk_score": fraud_analysis.get("risk_score", 0.0),
+                "defense_categories": defense_signal["categories"],
             })
             
             context["messages"].append({
@@ -153,7 +181,7 @@ class AIChatService:
                 "risk_level": fraud_analysis.get("risk_level", "low"),
             })
 
-            if any(token in transcript for token in ["诈骗", "可疑", "挂断", "报警", "核实"]):
+            if defense_signal["successful"]:
                 context["successful_identifications"] = context.get("successful_identifications", 0) + 1
 
             context.setdefault("fraud_score_history", []).append(fraud_analysis.get("risk_score", 0.0))
@@ -200,6 +228,7 @@ class AIChatService:
                 "created_at": datetime.utcnow().isoformat(),
                 "user_responses_count": 0,
                 "successful_identifications": 0,
+                "defense_signal_history": [],
                 "current_stage": "greeting"
             }
             
@@ -228,19 +257,20 @@ class AIChatService:
         try:
             context = self._get_session_context(session_id)
             messages = context.get("messages", [])
-            
-            user_responses = int(context.get("user_responses_count", 0))
-            successful_identifications = int(context.get("successful_identifications", 0))
+            user_messages = [msg for msg in messages if msg.get("role") == "user"]
+            metrics = self._calculate_practice_metrics(user_messages)
 
             # 生成会话总结
             summary = {
                 "session_id": session_id,
                 "total_messages": len(messages),
-                "user_responses": user_responses,
-                "successful_identifications": successful_identifications,
+                "user_responses": len(user_messages),
+                "successful_identifications": metrics["successful_identifications"],
                 "scenario_type": context.get("scenario_type"),
                 "difficulty_level": context.get("difficulty_level"),
-                "detection_rate": successful_identifications / max(user_responses, 1),
+                "detection_rate": metrics["detection_rate"],
+                "performance_score": metrics["performance_score"],
+                "identified_categories": metrics["identified_categories"],
                 "session_duration": _calculate_session_duration(context.get("created_at"))
             }
             
@@ -310,6 +340,7 @@ class AIChatService:
                 "created_at": datetime.utcnow().isoformat(),
                 "user_responses_count": 0,
                 "successful_identifications": 0,
+                "defense_signal_history": [],
                 "current_stage": "greeting"
             }
         
@@ -531,6 +562,78 @@ class AIChatService:
                 snippets.append(f"{role}:{content}")
 
         return " | ".join(snippets) if snippets else "刚开始通话。"
+
+    def _evaluate_user_defense_response(self, text: str) -> Dict[str, Any]:
+        """识别用户在陪练中的有效防诈动作。"""
+
+        normalized_text = re.sub(r"\s+", "", str(text or ""))
+        matched_categories = []
+
+        for category, patterns in DEFENSE_SIGNAL_PATTERNS.items():
+            if any(re.search(pattern, normalized_text, re.IGNORECASE) for pattern in patterns):
+                matched_categories.append(category)
+
+        signal_strength = min(1.0, len(matched_categories) * 0.22)
+        if any(category in matched_categories for category in {"refusal", "report", "terminate", "protect_info"}):
+            signal_strength = min(1.0, signal_strength + 0.18)
+        if "suspicion" in matched_categories and "verification" in matched_categories:
+            signal_strength = min(1.0, signal_strength + 0.12)
+
+        return {
+            "categories": matched_categories,
+            "successful": bool(matched_categories),
+            "signal_strength": signal_strength,
+        }
+
+    def _calculate_practice_metrics(self, user_messages: list[Dict[str, Any]]) -> Dict[str, Any]:
+        """根据用户发言重新计算陪练识别效果。"""
+
+        evaluations = [
+            self._evaluate_user_defense_response(str(message.get("content", "")))
+            for message in user_messages
+        ]
+        successful_identifications = sum(1 for evaluation in evaluations if evaluation["successful"])
+        user_responses = len(user_messages)
+        detection_rate = successful_identifications / max(user_responses, 1)
+
+        identified_categories = sorted({
+            category
+            for evaluation in evaluations
+            for category in evaluation["categories"]
+        })
+
+        first_success_turn = next(
+            (index for index, evaluation in enumerate(evaluations, start=1) if evaluation["successful"]),
+            None,
+        )
+        response_promptness = 0.0
+        if first_success_turn is not None:
+            response_promptness = 1.0 - ((first_success_turn - 1) / max(user_responses, 1))
+
+        average_signal_strength = (
+            sum(evaluation["signal_strength"] for evaluation in evaluations) / max(user_responses, 1)
+        )
+        category_coverage = min(len(identified_categories) / 4.0, 1.0)
+        performance_score = round(
+            min(
+                100.0,
+                max(
+                    0.0,
+                    detection_rate * 55.0
+                    + category_coverage * 25.0
+                    + response_promptness * 10.0
+                    + average_signal_strength * 10.0,
+                ),
+            ),
+            1,
+        )
+
+        return {
+            "successful_identifications": successful_identifications,
+            "detection_rate": detection_rate,
+            "performance_score": performance_score,
+            "identified_categories": identified_categories,
+        }
 
     def _get_scenario_reply_examples(self, scenario: str) -> str:
         """给模型一个简短的说话示例，降低客服播报感。"""

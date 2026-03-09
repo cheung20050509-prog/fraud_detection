@@ -27,13 +27,17 @@ bash start.sh
 - API docs: `http://127.0.0.1:8000/docs`
 - Health: `http://127.0.0.1:8000/health`
 
+After the addresses are printed, `start.sh` exits and the services continue running in the background, so you can safely disconnect SSH.
+
 ## What `start.sh` does
 - Detects usable Python/Node/npm from current environment.
 - Verifies backend critical dependencies.
 - Installs frontend dependencies if missing.
-- Starts backend (`uvicorn`) and frontend (`vite`) together.
+- Starts backend (`uvicorn`), then frontend (`vite`), then Cloudflare Quick Tunnel in one flow.
+- Uses internal `nohup` so these processes survive after the script exits.
+- Auto-starts the tunnel when `cloudflared` is available.
 - Waits for health checks and prints access URLs/log paths.
-- Stops both services on `Ctrl+C`.
+- Prints stop and log-follow commands, then exits.
 
 ## Strict Mode Policy
 Strict mode is enabled by default:
