@@ -1,5 +1,7 @@
 # Fraud Blocking System
 
+启动教程见 [README_STARTUP.md](README_STARTUP.md)。
+
 ## Overview
 Fraud Blocking System provides three core workflows:
 - `/practice`: AI conversation practice against scam scenarios.
@@ -74,6 +76,14 @@ NODE_BIN=/path/to/node NPM_BIN=/path/to/npm bash start.sh
 Use Node to invoke tools directly:
 ```bash
 cd /root/autodl-tmp/fraud-blocking-system/frontend
-/root/autodl-tmp/conda-envs/fraud_detection/bin/node ./node_modules/vue-tsc/bin/vue-tsc.js --noEmit
-/root/autodl-tmp/conda-envs/fraud_detection/bin/node ./node_modules/vite/bin/vite.js build
+/root/autodl-tmp/fraud_detection/bin/node ./node_modules/vue-tsc/bin/vue-tsc.js --noEmit
+/root/autodl-tmp/fraud_detection/bin/node ./node_modules/vite/bin/vite.js build
 ```
+
+### `node` or `npm` not found
+This project expects the `fraud_detection` conda environment because `node` and `npm` are provided there:
+```bash
+conda activate fraud_detection
+```
+
+If you want a fuller walkthrough, use [README_STARTUP.md](README_STARTUP.md).

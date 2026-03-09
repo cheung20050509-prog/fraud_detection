@@ -30,6 +30,7 @@ frontend/dist/
 
 # Runtime data
 backend/logs/
+backend/*.log
 frontend/.logs/
 backend/uploads/
 backend/*.db

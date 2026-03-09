@@ -11,7 +11,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiofiles
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+import numpy as np
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 import logging
 
@@ -55,6 +56,20 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _to_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 def _detect_keywords(text: str) -> Dict[str, Any]:
@@ -280,7 +295,7 @@ def _build_results_payload(task: Dict[str, Any]) -> Dict[str, Any]:
         "file_name": task.get("file_name"),
         "file_size": task.get("file_size"),
         "error": task.get("error"),
-        "results": task.get("results"),
+        "results": _to_json_safe(task.get("results")),
     }
 
 # Pydantic模型
@@ -302,10 +317,10 @@ class CaseCreateRequest(BaseModel):
 async def upload_file_for_analysis(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    user_id: int = None,
-    case_name: str = "默认案例",
-    fraud_type: str = "unknown",
-    analysis_types: str = "fraud_detection,voice_analysis,transcription",
+    user_id: Optional[int] = Form(default=None),
+    case_name: str = Form(default="默认案例"),
+    fraud_type: str = Form(default="unknown"),
+    analysis_types: str = Form(default="fraud_detection,voice_analysis,transcription"),
     db: Session = Depends(get_db)
 ):
     """上传文件进行分析 - 软著申请：文件上传和预处理"""
