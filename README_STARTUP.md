@@ -86,6 +86,55 @@ Forward these ports to your local machine first:
 
 After port forwarding, open local URLs such as `http://127.0.0.1:5173`.
 
+## AutoDL Quick Tunnel
+
+If you are running on AutoDL or another hosted environment where direct inbound access is inconvenient, use Cloudflare Quick Tunnel.
+
+The frontend dev server already proxies `/api` and `/ws` to the backend, so exposing `5173` is usually enough for the whole app.
+
+### Install `cloudflared`
+
+```bash
+cd /root/autodl-tmp
+wget -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+chmod +x cloudflared
+./cloudflared --version
+```
+
+### Expose the frontend
+
+```bash
+cd /root/autodl-tmp
+./cloudflared tunnel --protocol http2 --url http://127.0.0.1:5173
+```
+
+Why `--protocol http2`:
+
+- Some hosted environments block or degrade QUIC/UDP
+- `http2` is usually more stable on AutoDL
+
+After startup, `cloudflared` prints a temporary public URL like:
+
+```text
+https://example-name.trycloudflare.com
+```
+
+Open that URL in your local browser.
+
+### Optional: Expose backend docs separately
+
+```bash
+cd /root/autodl-tmp
+./cloudflared tunnel --protocol http2 --url http://127.0.0.1:8000
+```
+
+### Notes
+
+- Quick Tunnel is free and suitable for development/testing
+- The URL is temporary and changes when you restart the tunnel
+- Keep the `cloudflared` process running, or the public URL will stop working
+- The frontend Vite config already allows `*.trycloudflare.com` hosts
+
 ## Common Problems
 
 ### `node: No such file or directory`
@@ -99,6 +148,16 @@ conda activate fraud_detection
 ### `npm: command not found`
 
 Same root cause as above. `npm` is expected to come from the conda environment.
+
+### `Blocked request. This host is not allowed.`
+
+If you see this when using Cloudflare Quick Tunnel, make sure you are using the updated Vite config that allows `*.trycloudflare.com`.
+
+If you need to allow more custom hosts, set:
+
+```bash
+VITE_ALLOWED_HOSTS=host1.example.com,host2.example.com
+```
 
 ### Backend health check fails
 

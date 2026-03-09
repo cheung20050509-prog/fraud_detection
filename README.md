@@ -13,7 +13,7 @@ The backend is FastAPI and the frontend is Vue 3 + Vite.
 ## One-Click Start (Linux)
 ### 1. Activate environment
 ```bash
-conda activate /root/autodl-tmp/fraud_detection
+conda activate fraud_detection
 ```
 
 ### 2. Start services
@@ -87,3 +87,6 @@ conda activate fraud_detection
 ```
 
 If you want a fuller walkthrough, use [README_STARTUP.md](README_STARTUP.md).
+
+### Remote hosted environments
+For AutoDL-style environments, see the Cloudflare Quick Tunnel section in [README_STARTUP.md](README_STARTUP.md).

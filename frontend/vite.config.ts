@@ -2,6 +2,14 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
 
+const allowedHosts = [
+  '.trycloudflare.com',
+  ...((process.env.VITE_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean)),
+]
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [vue()],
@@ -13,6 +21,7 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    allowedHosts,
     proxy: {
       // 开发环境代理到后端API
       '/api': {
